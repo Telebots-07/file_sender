@@ -37,7 +37,7 @@ force_sub_channels: Set[int] = set()  # Forced subscription channels
 cover_photos: Dict[str, str] = {}  # File name to cover photo file_id
 message_pairs: Dict[int, tuple] = {}  # user_id: (request_msg_id, response_msg_id)
 admin_pending_action: Dict[int, str] = {}  # user_id: pending admin action
-last_message_time: float = 0  # Global rate limiter for message sending
+admin_list: Set[int] = {ADMIN_ID}  # Set of admin IDs (starting with the main admin)
 
 # Constants
 SEARCH_LIMIT = 50
@@ -46,7 +46,6 @@ VERIFICATION_DURATION = 3600  # 1 hour
 PAGE_SIZE = 10  # Results per page
 DELETE_DELAY = 600  # 10 minutes in seconds
 ADMIN_PASSWORD = "12122"
-MESSAGE_RATE_LIMIT = 1  # Minimum seconds between messages to avoid flood
 
 # Helper: Generate dynamic ID
 def generate_dynamic_id(length: int = 10) -> str:
@@ -65,17 +64,11 @@ async def shorten_link(long_url: str) -> str:
             logger.error(f"Shorten link error: {e}")
     return long_url
 
-# Helper: Global rate limiter for message sending
-async def rate_limit_message():
-    global last_message_time
-    now = time.time()
-    time_since_last = now - last_message_time
-    if time_since_last < MESSAGE_RATE_LIMIT:
-        await asyncio.sleep(MESSAGE_RATE_LIMIT - time_since_last)
-    last_message_time = time.time()
-
 # Helper: Check subscription status
-async def check_subscription(client: Client, user_id: int) -> bool:
+async def check_subscription(client: Client, user_id: int, chat_id: int) -> bool:
+    # Skip subscription check in groups
+    if chat_id < 0:  # Negative chat_id indicates a group
+        return True
     for channel_id in force_sub_channels:
         try:
             member = await client.get_chat_member(channel_id, user_id)
@@ -83,114 +76,87 @@ async def check_subscription(client: Client, user_id: int) -> bool:
                 return False
         except (errors.UserNotParticipant, errors.PeerIdInvalid):
             return False
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in subscription check: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            return False
         except Exception as e:
             logger.error(f"Subscription check error: {e}")
             return False
     return True
 
 # Helper: Delete messages after a delay
-async def delete_messages_later(client: Client, user_id: int, request_msg_id: int, response_msg_id: int):
+async def delete_messages_later(client: Client, chat_id: int, request_msg_id: int, response_msg_id: int):
     await asyncio.sleep(DELETE_DELAY)
     try:
-        await client.delete_messages(user_id, [request_msg_id, response_msg_id])
-        logger.info(f"Deleted messages for user {user_id}: {request_msg_id}, {response_msg_id}")
-    except errors.FloodWait as e:
-        logger.warning(f"Flood wait in delete messages: {e.x} seconds")
-        await asyncio.sleep(e.x)
+        await client.delete_messages(chat_id, [request_msg_id, response_msg_id])
+        logger.info(f"Deleted messages in chat {chat_id}: {request_msg_id}, {response_msg_id}")
     except Exception as e:
-        logger.error(f"Error deleting messages for user {user_id}: {e}")
+        logger.error(f"Error deleting messages in chat {chat_id}: {e}")
     finally:
-        message_pairs.pop(user_id, None)
+        message_pairs.pop(chat_id, None)
 
 # Start command handler
-@app.on_message(filters.private & filters.command("start"))
+@app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
 
-    # Check subscription
-    if force_sub_channels and not await check_subscription(client, user_id):
+    # Check subscription (only in private chats)
+    if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
         buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
         buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
-        await rate_limit_message()
-        try:
-            await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in start command: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
+        await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # Welcome message for new users
-    if not user_requests.get(user_id):
-        await rate_limit_message()
-        try:
-            await client.send_message(user_id, "Welcome! Search for files by typing a keyword.\nClick below for download instructions:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]]))
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in welcome message: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await client.send_message(user_id, "Welcome! Search for files by typing a keyword.\nClick below for download instructions:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]]))
+    # Welcome message for new users (only in private chats)
+    if chat_id > 0 and not user_requests.get(user_id):
+        await client.send_message(user_id, "Welcome! Search for files by typing a keyword.\nClick below for download instructions:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]]))
 
-    # Admin menu (styled with a boxed appearance)
-    if user_id == ADMIN_ID:
-        await rate_limit_message()
-        try:
-            await message.reply(
-                "👨‍💼 Admin Menu\n"
-                "━━━━━━━━━━━━━━\n"
-                "   Admin Options   \n"
-                "━━━━━━━━━━━━━━",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Add DB Channel", callback_data="add_db")],
-                    [InlineKeyboardButton("Add Subscription Channel", callback_data="add_sub")],
-                    [InlineKeyboardButton("View Statistics", callback_data="stats")],
-                    [InlineKeyboardButton("Broadcast Message", callback_data="broadcast")],
-                    [InlineKeyboardButton("Set Cover Photo", callback_data="set_cover")],
-                    [InlineKeyboardButton("Remove Channel", callback_data="remove_channel")]
-                ])
-            )
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in admin menu: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply(
-                "👨‍💼 Admin Menu\n"
-                "━━━━━━━━━━━━━━\n"
-                "   Admin Options   \n"
-                "━━━━━━━━━━━━━━",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Add DB Channel", callback_data="add_db")],
-                    [InlineKeyboardButton("Add Subscription Channel", callback_data="add_sub")],
-                    [InlineKeyboardButton("View Statistics", callback_data="stats")],
-                    [InlineKeyboardButton("Broadcast Message", callback_data="broadcast")],
-                    [InlineKeyboardButton("Set Cover Photo", callback_data="set_cover")],
-                    [InlineKeyboardButton("Remove Channel", callback_data="remove_channel")]
-                ])
-            )
+    # Admin menu (text-based with "three lines" style, only in private chats)
+    if chat_id > 0 and user_id in admin_list:
+        await message.reply(
+            "👨‍💼 Admin Menu\n"
+            "━━━━━━━━━━━━━━\n"
+            "Available Commands:\n"
+            "/add_db - Add a DB channel\n"
+            "/add_sub - Add a subscription channel\n"
+            "/stats - View bot statistics\n"
+            "/broadcast - Broadcast a message\n"
+            "/set_cover - Set a cover photo\n"
+            "/remove_channel - Remove a channel\n"
+            "/admin_list - View admin list\n"
+            "━━━━━━━━━━━━━━\n"
+            "Enter the command to proceed (password required)."
+        )
     else:
-        await rate_limit_message()
-        try:
-            await message.reply("Hi! Send me a keyword to search for files.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in user start: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("Hi! Send me a keyword to search for files.")
+        await message.reply("Hi! Send me a keyword to search for files.")
 
-# Handle text queries
-@app.on_message(filters.private & filters.text & ~filters.command(["start"]))
+# Handle admin commands
+@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "set_cover", "remove_channel", "admin_list"]))
+async def handle_admin_commands(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in admin_list:
+        await message.reply("🚫 This action is restricted to admins only.")
+        return
+
+    command = message.command[0]
+    if command == "admin_list":
+        admin_text = "👥 Admin List\n━━━━━━━━━━━━━━\n" + "\n".join(f"Admin ID: {admin_id}" for admin_id in admin_list) + "\n━━━━━━━━━━━━━━"
+        await message.reply(admin_text)
+        return
+
+    admin_pending_action[user_id] = command
+    await message.reply("🔒 Please enter the admin password to proceed:")
+
+# Handle text queries (works in both private and group chats)
+@app.on_message(filters.text & ~filters.command(["start", "add_db", "add_sub", "stats", "broadcast", "set_cover", "remove_channel", "admin_list"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     query = message.text.strip()
 
-    # Check if the message is a password response for admin
-    if user_id == ADMIN_ID and user_id in admin_pending_action:
+    # Check if the message is a password response for admin (only in private chats)
+    if chat_id > 0 and user_id in admin_list and user_id in admin_pending_action:
         if query == ADMIN_PASSWORD:
             action = admin_pending_action.pop(user_id)
-            await rate_limit_message()
             if action == "add_db":
                 await message.reply("Forward a message from the DB channel you want to add (bot must be admin).")
             elif action == "add_sub":
@@ -214,6 +180,8 @@ async def handle_query(client: Client, message: Message):
                     [InlineKeyboardButton(f"Sub: {ch}", callback_data=f"rm_sub_{ch}") for ch in force_sub_channels]
                 ]
                 await message.reply("Select channel to remove:", reply_markup=InlineKeyboardMarkup(buttons))
+            elif action == "broadcast":
+                await message.reply("Please send the message you want to broadcast to all groups.")
             # Handle forwarded channel actions
             elif action.startswith("add_db_forward_") or action.startswith("add_sub_forward_"):
                 channel_type, _, channel_id = action.split("_")[1:4]
@@ -223,11 +191,6 @@ async def handle_query(client: Client, message: Message):
                     if bot_member.status not in ("administrator", "creator"):
                         await message.reply("❌ Bot must be an admin in the channel.")
                         return
-                except errors.FloodWait as e:
-                    logger.warning(f"Flood wait in admin check: {e.x} seconds")
-                    await asyncio.sleep(e.x)
-                    await message.reply("❌ Error checking bot admin status.")
-                    return
                 except Exception as e:
                     logger.error(f"Error checking bot admin status: {e}")
                     await message.reply("❌ Error checking bot admin status.")
@@ -248,56 +211,44 @@ async def handle_query(client: Client, message: Message):
                 force_sub_channels.discard(channel_id)
                 await message.reply(f"✅ Subscription channel {channel_id} removed.")
         else:
-            await rate_limit_message()
             await message.reply("❌ Incorrect password. Try again.")
             admin_pending_action.pop(user_id, None)
         return
 
-    # Check subscription
-    if force_sub_channels and not await check_subscription(client, user_id):
+    # Check subscription (only in private chats)
+    if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
         buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
         buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
-        await rate_limit_message()
-        try:
-            await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in subscription prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
+        await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     # Input validation
     if len(query) < 3:
-        await rate_limit_message()
-        try:
-            await message.reply("Please enter a search term with at least 3 characters.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in input validation: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("Please enter a search term with at least 3 characters.")
+        await message.reply("Please enter a search term with at least 3 characters.")
         return
 
-    # Rate limiting
-    now = time.time()
-    user_requests[user_id] = [t for t in user_requests[user_id] if now - t < 3600]
-    if len(user_requests[user_id]) >= REQUEST_LIMIT:
-        await rate_limit_message()
-        try:
+    # Rate limiting (only in private chats)
+    if chat_id > 0:
+        now = time.time()
+        user_requests[user_id] = [t for t in user_requests[user_id] if now - t < 3600]
+        if len(user_requests[user_id]) >= REQUEST_LIMIT:
             await message.reply(f"⏱️ You've reached the {REQUEST_LIMIT} searches/hour limit. Try again later.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in rate limit message: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply(f"⏱️ You've reached the {REQUEST_LIMIT} searches/hour limit. Try again later.")
-        return
+            return
+        user_requests[user_id].append(now)
 
-    user_requests[user_id].append(now)
-    await rate_limit_message()
-    try:
-        await message.reply("🔍 Searching in database channels...")
-    except errors.FloodWait as e:
-        logger.warning(f"Flood wait in search start: {e.x} seconds")
-        await asyncio.sleep(e.x)
-        await message.reply("🔍 Searching in database channels...")
+    # Check if bot is admin in the group
+    if chat_id < 0:
+        try:
+            bot_member = await client.get_chat_member(chat_id, "me")
+            if bot_member.status not in ("administrator", "creator"):
+                await message.reply("❌ I need to be an admin in this group to perform searches.")
+                return
+        except Exception as e:
+            logger.error(f"Error checking bot admin status in group {chat_id}: {e}")
+            await message.reply("❌ Error checking my admin status in this group.")
+            return
+
+    await message.reply("🔍 Searching in database channels...")
 
     # Search channels concurrently
     results = []
@@ -322,9 +273,6 @@ async def handle_query(client: Client, message: Message):
                         "msg_id": msg.id,
                         "channel_id": channel_id
                     })
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in channel {channel_id}: {e.x} seconds")
-            await asyncio.sleep(e.x)
         except errors.ChannelPrivate:
             logger.error(f"Channel {channel_id} is private or bot lacks access")
             db_channels.discard(channel_id)
@@ -335,13 +283,7 @@ async def handle_query(client: Client, message: Message):
     await asyncio.gather(*tasks)
 
     if not results:
-        await rate_limit_message()
-        try:
-            await message.reply("No files found in the database channels.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in no files found: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("No files found in the database channels.")
+        await message.reply("No files found in the database channels.")
         return
 
     # Paginate results
@@ -363,50 +305,31 @@ async def handle_query(client: Client, message: Message):
                 nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
             if nav_buttons:
                 buttons.append(nav_buttons)
-        await rate_limit_message()
-        try:
-            response = await message.reply(f"📂 Select a file (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
-            message_pairs[user_id] = (message.id, response.id)
-            asyncio.create_task(delete_messages_later(client, user_id, message.id, response.id))
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in search results: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            response = await message.reply(f"📂 Select a file (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
-            message_pairs[user_id] = (message.id, response.id)
-            asyncio.create_task(delete_messages_later(client, user_id, message.id, response.id))
+        response = await message.reply(f"📂 Select a file (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
+        message_pairs[chat_id] = (message.id, response.id)
+        asyncio.create_task(delete_messages_later(client, chat_id, message.id, response.id))
 
 # Callback query handler
 @app.on_callback_query()
 async def handle_callbacks(client: Client, callback_query):
     data = callback_query.data
     user_id = callback_query.from_user.id
+    chat_id = callback_query.message.chat.id
 
     if data == "check_sub":
-        if await check_subscription(client, user_id):
+        if await check_subscription(client, user_id, chat_id):
             verified_users[user_id] = time.time()
-            await rate_limit_message()
-            try:
-                await callback_query.message.edit("✅ Subscription verified! You can now search for files.")
-            except errors.FloodWait as e:
-                logger.warning(f"Flood wait in subscription verification: {e.x} seconds")
-                await asyncio.sleep(e.x)
-                await callback_query.message.edit("✅ Subscription verified! You can now search for files.")
+            await callback_query.message.edit("✅ Subscription verified! You can now search for files.")
         else:
             await callback_query.answer("Please join all required channels.", show_alert=True)
 
     elif data.startswith("get_"):
         _, channel_id, msg_id, _ = data.split("_", 3)
 
-        if force_sub_channels and not await check_subscription(client, user_id):
+        if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
             buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
             buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
-            await rate_limit_message()
-            try:
-                await callback_query.message.reply("Please join the required channels:", reply_markup=InlineKeyboardMarkup(buttons))
-            except errors.FloodWait as e:
-                logger.warning(f"Flood wait in subscription prompt: {e.x} seconds")
-                await asyncio.sleep(e.x)
-                await callback_query.message.reply("Please join the required channels:", reply_markup=InlineKeyboardMarkup(buttons))
+            await callback_query.message.reply("Please join the required channels:", reply_markup=InlineKeyboardMarkup(buttons))
             return
 
         verified_time = verified_users.get(user_id, 0)
@@ -416,162 +339,96 @@ async def handle_callbacks(client: Client, callback_query):
         file_link = f"https://t.me/c/{str(channel_id)[4:]}/{msg_id}"
         if use_shortener:
             file_link = await shorten_link(file_link)
-            await rate_limit_message()
-            try:
-                await callback_query.message.reply(
-                    "ℹ️ type movie name: hello and get ur files like this ok\n🔗 Link generated with shortening:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Download", url=file_link)],
-                        [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
-                    ]))
-            except errors.FloodWait as e:
-                logger.warning(f"Flood wait in shortened link: {e.x} seconds")
-                await asyncio.sleep(e.x)
-                await callback_query.message.reply(
-                    "ℹ️ type movie name: hello and get ur files like this ok\n🔗 Link generated with shortening:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Download", url=file_link)],
-                        [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
-                    ]))
+            await callback_query.message.reply(
+                "ℹ️ type movie name: hello and get ur files like this ok\n🔗 Link generated with shortening:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Download", url=file_link)],
+                    [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
+                ]))
         else:
-            await rate_limit_message()
-            try:
-                await callback_query.message.reply(
-                    "ℹ️ type movie name: hello and get ur files like this ok\n📥 Direct download link:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Download", url=file_link)],
-                        [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
-                    ]))
-            except errors.FloodWait as e:
-                logger.warning(f"Flood wait in direct link: {e.x} seconds")
-                await asyncio.sleep(e.x)
-                await callback_query.message.reply(
-                    "ℹ️ type movie name: hello and get ur files like this ok\n📥 Direct download link:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Download", url=file_link)],
-                        [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
-                    ]))
+            await callback_query.message.reply(
+                "ℹ️ type movie name: hello and get ur files like this ok\n📥 Direct download link:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Download", url=file_link)],
+                    [InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]
+                ]))
 
     # Admin actions with password prompt
-    elif data in ["add_db", "add_sub", "set_cover", "stats", "remove_channel"] and user_id == ADMIN_ID:
+    elif data in ["add_db", "add_sub", "set_cover", "stats", "remove_channel"] and user_id in admin_list:
         admin_pending_action[user_id] = data
-        await rate_limit_message()
-        try:
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in password prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
+        await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
 
-    elif data.startswith("rm_db_") and user_id == ADMIN_ID:
+    elif data.startswith("rm_db_") and user_id in admin_list:
         admin_pending_action[user_id] = data
-        await rate_limit_message()
-        try:
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in password prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
+        await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
 
-    elif data.startswith("rm_sub_") and user_id == ADMIN_ID:
+    elif data.startswith("rm_sub_") and user_id in admin_list:
         admin_pending_action[user_id] = data
-        await rate_limit_message()
-        try:
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in password prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
+        await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
 
-    elif data.startswith("add_db_forward_") and user_id == ADMIN_ID:
+    elif data.startswith("add_db_forward_") and user_id in admin_list:
         admin_pending_action[user_id] = data
-        await rate_limit_message()
-        try:
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in password prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
+        await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
 
-    elif data.startswith("add_sub_forward_") and user_id == ADMIN_ID:
+    elif data.startswith("add_sub_forward_") and user_id in admin_list:
         admin_pending_action[user_id] = data
-        await rate_limit_message()
-        try:
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in password prompt: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
+        await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
 
 # Handle forwarded message from admin (strictly for admin)
 @app.on_message(filters.private & filters.forwarded)
 async def add_channel(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        await rate_limit_message()
-        try:
-            await message.reply("🚫 This action is restricted to admins only.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in admin restriction: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("🚫 This action is restricted to admins only.")
+    if user_id not in admin_list:
+        await message.reply("🚫 This action is restricted to admins only.")
         return
 
     chat = message.forward_from_chat
     if not chat:
-        await rate_limit_message()
-        try:
-            await message.reply("❌ Invalid forwarded message.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in invalid forward: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("❌ Invalid forwarded message.")
+        await message.reply("❌ Invalid forwarded message.")
         return
 
     try:
         bot_member = await client.get_chat_member(chat.id, "me")
         if bot_member.status not in ("administrator", "creator"):
-            await rate_limit_message()
             await message.reply("❌ Bot must be an admin in the channel.")
             return
-    except errors.FloodWait as e:
-        logger.warning(f"Flood wait in admin check: {e.x} seconds")
-        await asyncio.sleep(e.x)
-        await rate_limit_message()
-        await message.reply("❌ Error checking bot admin status.")
-        return
     except Exception as e:
         logger.error(f"Error checking bot admin status: {e}")
-        await rate_limit_message()
         await message.reply("❌ Error checking bot admin status.")
         return
 
-    await rate_limit_message()
-    try:
-        await message.reply("Is this a DB channel or a subscription channel?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("DB Channel", callback_data=f"add_db_forward_{chat.id}")],
-            [InlineKeyboardButton("Subscription Channel", callback_data=f"add_sub_forward_{chat.id}")]
-        ]))
-    except errors.FloodWait as e:
-        logger.warning(f"Flood wait in channel type prompt: {e.x} seconds")
-        await asyncio.sleep(e.x)
-        await message.reply("Is this a DB channel or a subscription channel?", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("DB Channel", callback_data=f"add_db_forward_{chat.id}")],
-            [InlineKeyboardButton("Subscription Channel", callback_data=f"add_sub_forward_{chat.id}")]
-        ]))
+    await message.reply("Is this a DB channel or a subscription channel?", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("DB Channel", callback_data=f"add_db_forward_{chat.id}")],
+        [InlineKeyboardButton("Subscription Channel", callback_data=f"add_sub_forward_{chat.id}")]
+    ]))
+
+# Handle broadcast message after password verification
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|add_db$|add_sub$|stats$|broadcast$|set_cover$|remove_channel$|admin_list$).+"))
+async def handle_broadcast_message(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
+        return
+
+    broadcast_message = message.text.strip()
+    admin_pending_action.pop(user_id, None)
+
+    # Send broadcast to all DB and subscription channels
+    all_channels = db_channels.union(force_sub_channels)
+    for channel_id in all_channels:
+        try:
+            await client.send_message(channel_id, f"📢 Broadcast Message:\n{broadcast_message}")
+            logger.info(f"Broadcast sent to channel {channel_id}")
+        except Exception as e:
+            logger.error(f"Error sending broadcast to channel {channel_id}: {e}")
+
+    await message.reply(f"✅ Broadcast sent to {len(all_channels)} channels.")
 
 # Admin sets cover image (strictly for admin)
 @app.on_message(filters.private & filters.photo)
 async def handle_cover_photo(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        await rate_limit_message()
-        try:
-            await message.reply("🚫 This action is restricted to admins only.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in admin restriction: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("🚫 This action is restricted to admins only.")
+    if user_id not in admin_list:
+        await message.reply("🚫 This action is restricted to admins only.")
         return
 
     if user_id not in admin_pending_action or admin_pending_action[user_id] != "set_cover":
@@ -580,22 +437,10 @@ async def handle_cover_photo(client: Client, message: Message):
     if message.caption:
         filename = message.caption.strip()
         cover_photos[filename] = message.photo.file_id
-        await rate_limit_message()
-        try:
-            await message.reply(f"✅ Cover photo set for {filename}.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in cover photo set: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply(f"✅ Cover photo set for {filename}.")
+        await message.reply(f"✅ Cover photo set for {filename}.")
         admin_pending_action.pop(user_id, None)
     else:
-        await rate_limit_message()
-        try:
-            await message.reply("❌ Please provide the exact file name in the caption.")
-        except errors.FloodWait as e:
-            logger.warning(f"Flood wait in cover photo error: {e.x} seconds")
-            await asyncio.sleep(e.x)
-            await message.reply("❌ Please provide the exact file name in the caption.")
+        await message.reply("❌ Please provide the exact file name in the caption.")
 
 # Run bot
 if __name__ == "__main__":
