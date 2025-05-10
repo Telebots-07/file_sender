@@ -1,6 +1,7 @@
 import asyncio
 from pyrogram import Client, filters, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, ChatMember
+from pyrogram.enums import ChatMemberStatus
 import time
 import os
 from datetime import datetime, timedelta
@@ -85,6 +86,32 @@ async def log_to_channel(client: Client, message: str):
     except Exception as e:
         logger.error(f"Failed to send log to channel {log_channel}: {e}")
 
+# Helper: Check if the bot has sufficient privileges in a chat
+async def check_bot_privileges(client: Client, chat_id: int, require_admin: bool = True) -> bool:
+    try:
+        bot_member: ChatMember = await client.get_chat_member(chat_id, "me")
+        status = bot_member.status
+        # For channels, "member" is sufficient for searching if the bot can read messages
+        if not require_admin:
+            return status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        # For groups and channels where admin is required (e.g., sending messages)
+        if status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            await log_to_channel(client, f"Bot lacks admin privileges in chat {chat_id}: Status is {status}")
+            return False
+        # Check if the bot has necessary permissions (e.g., can post messages)
+        if isinstance(bot_member, ChatMember) and hasattr(bot_member, 'privileges'):
+            if bot_member.privileges and not bot_member.privileges.can_post_messages:
+                await log_to_channel(client, f"Bot lacks post message privileges in chat {chat_id}")
+                return False
+        return True
+    except errors.UserNotParticipant:
+        await log_to_channel(client, f"Bot is not a participant in chat {chat_id}")
+        return False
+    except Exception as e:
+        await log_to_channel(client, f"Error checking bot privileges in chat {chat_id}: {str(e)}")
+        logger.error(f"Error checking bot privileges in chat {chat_id}: {e}")
+        return False
+
 # Helper: Check subscription status (only for private chats)
 async def check_subscription(client: Client, user_id: int, chat_id: int) -> bool:
     if chat_id < 0:  # Skip subscription check in groups
@@ -92,7 +119,7 @@ async def check_subscription(client: Client, user_id: int, chat_id: int) -> bool
     for channel_id in force_sub_channels:
         try:
             member = await client.get_chat_member(channel_id, user_id)
-            if member.status not in ("member", "administrator", "creator"):
+            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 return False
         except (errors.UserNotParticipant, errors.PeerIdInvalid):
             return False
@@ -136,7 +163,7 @@ async def start(client: Client, message: Message):
     if chat_id > 0:
         await rate_limit_message()
         await client.send_message(user_id, "Welcome! Search for files by typing a keyword.\nClick below for download instructions:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("How to Download", url="https://t.me/c/2323164776/7")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")]]))
 
     # Admin menu (text-based with "three lines" style, only in private chats)
     if chat_id > 0 and user_id in admin_list:
@@ -238,17 +265,9 @@ async def handle_query(client: Client, message: Message):
             elif action.startswith("add_db_forward_") or action.startswith("add_sub_forward_"):
                 channel_type, _, channel_id = action.split("_")[1:4]
                 channel_id = int(channel_id)
-                try:
-                    bot_member = await client.get_chat_member(channel_id, "me")
-                    if bot_member.status not in ("administrator", "creator"):
-                        await rate_limit_message()
-                        await message.reply("❌ Bot must be an admin in the channel.")
-                        return
-                except Exception as e:
-                    await log_to_channel(client, f"Error checking bot admin status for channel {channel_id}: {str(e)}")
-                    logger.error(f"Error checking bot admin status: {e}")
+                if not await check_bot_privileges(client, channel_id):
                     await rate_limit_message()
-                    await message.reply("❌ Error checking bot admin status.")
+                    await message.reply("❌ Bot must be an admin in the channel with sufficient privileges.")
                     return
 
                 if channel_type == "db":
@@ -293,19 +312,11 @@ async def handle_query(client: Client, message: Message):
         await message.reply("Please enter a search term with at least 3 characters.")
         return
 
-    # Check if bot is admin in the group
+    # Check if bot has sufficient privileges in the group
     if chat_id < 0:
-        try:
-            bot_member = await client.get_chat_member(chat_id, "me")
-            if bot_member.status not in ("administrator", "creator"):
-                await rate_limit_message()
-                await message.reply("❌ I need to be an admin in this group to perform searches.")
-                return
-        except Exception as e:
-            await log_to_channel(client, f"Error checking bot admin status in group {chat_id}: {str(e)}")
-            logger.error(f"Error checking bot admin status in group {chat_id}: {e}")
+        if not await check_bot_privileges(client, chat_id):
             await rate_limit_message()
-            await message.reply("❌ Error checking my admin status in this group.")
+            await message.reply("❌ I need to be an admin in this group with sufficient privileges to perform searches.")
             return
 
     await rate_limit_message()
@@ -315,8 +326,7 @@ async def handle_query(client: Client, message: Message):
     results = []
     async def search_channel(channel_id: int):
         try:
-            bot_member = await client.get_chat_member(channel_id, "me")
-            if bot_member.status not in ("administrator", "creator", "member"):
+            if not await check_bot_privileges(client, channel_id, require_admin=False):
                 logger.warning(f"Bot lacks access to channel {channel_id}")
                 return
 
@@ -475,17 +485,9 @@ async def add_channel(client: Client, message: Message):
         await message.reply("❌ Invalid forwarded message.")
         return
 
-    try:
-        bot_member = await client.get_chat_member(chat.id, "me")
-        if bot_member.status not in ("administrator", "creator"):
-            await rate_limit_message()
-            await message.reply("❌ Bot must be an admin in the channel.")
-            return
-    except Exception as e:
-        await log_to_channel(client, f"Error checking bot admin status for channel {chat.id}: {str(e)}")
-        logger.error(f"Error checking bot admin status: {e}")
+    if not await check_bot_privileges(client, chat.id):
         await rate_limit_message()
-        await message.reply("❌ Error checking bot admin status.")
+        await message.reply("❌ Bot must be an admin in the channel with sufficient privileges.")
         return
 
     if user_id in admin_pending_action and admin_pending_action[user_id] == "set_logchannel":
