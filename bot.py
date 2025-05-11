@@ -6,7 +6,7 @@ import time
 import os
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
-from typing import Dict, Set, Optional, Deque, Tuple
+from typing import Dict, Set, Optional, Deque, Tuple, List
 import random
 import string
 import aiohttp
@@ -41,6 +41,9 @@ admin_list: Set[int] = {ADMIN_ID}  # Set of admin IDs (starting with the main ad
 log_channel: Optional[int] = None  # Log channel ID (set by admin)
 user_search_history: Dict[int, Deque[Tuple[str, float]]] = defaultdict(lambda: deque(maxlen=5))  # user_id: [(query, timestamp)]
 start_ids: Dict[int, str] = {}  # user_id: start_id
+user_search_counts: Dict[int, int] = defaultdict(int)  # user_id: number of searches
+search_cache: Dict[int, List[dict]] = {}  # chat_id: cached search results (temporary)
+search_cache_expiry: Dict[int, float] = {}  # chat_id: cache expiry timestamp
 
 # Constants
 SEARCH_LIMIT = 50
@@ -49,8 +52,9 @@ PAGE_SIZE = 10  # Results per page
 DELETE_DELAY = 600  # 10 minutes in seconds
 ADMIN_PASSWORD = "12122"
 RATE_LIMIT_WINDOW = 30  # Time window in seconds for rate limiting
-RATE_LIMIT_MAX_MESSAGES = 20  # Max messages allowed in the window
-MIN_MESSAGE_DELAY = 1.0  # Minimum delay between messages
+RATE_LIMIT_MAX_MESSAGES = 20  # Max messages allowed in the window (configurable)
+MIN_MESSAGE_DELAY = 1.0  # Minimum delay between messages (configurable)
+CACHE_DURATION = 300  # 5 minutes for search result caching
 
 # Dynamic rate limiting
 message_timestamps: Deque[float] = deque(maxlen=RATE_LIMIT_MAX_MESSAGES)
@@ -59,7 +63,7 @@ is_sending = False
 
 # Helper: Dynamic rate limiter to prevent flooding
 async def rate_limit_message():
-    global is_sending
+    global RATE_LIMIT_MAX_MESSAGES, MIN_MESSAGE_DELAY
     now = time.time()
 
     # Clean up old timestamps
@@ -68,7 +72,6 @@ async def rate_limit_message():
 
     # Check if we're within the rate limit
     if len(message_timestamps) >= RATE_LIMIT_MAX_MESSAGES:
-        # Calculate how long to wait until the oldest message is outside the window
         wait_time = RATE_LIMIT_WINDOW - (now - message_timestamps[0])
         if wait_time > 0:
             logger.info(f"Rate limit hit, waiting {wait_time:.2f} seconds")
@@ -122,11 +125,15 @@ async def shorten_link(long_url: str) -> str:
         try:
             async with session.get(api_url, timeout=5) as response:
                 if response.status == 200:
-                    return (await response.text()).strip()
-                logger.warning(f"GPLinks API failed: {response.status}")
+                    shortened_url = (await response.text()).strip()
+                    logger.info(f"Shortened URL: {shortened_url}")
+                    return shortened_url
+                else:
+                    logger.warning(f"GPLinks API failed with status {response.status}")
+                    return long_url
         except Exception as e:
-            logger.error(f"Shorten link error: {e}")
-    return long_url
+            logger.error(f"Shorten link error: {str(e)}")
+            return long_url
 
 # Helper: Send log message to log channel if set
 async def log_to_channel(client: Client, message: str):
@@ -190,6 +197,22 @@ async def delete_messages_later(client: Client, chat_id: int, request_msg_id: in
         logger.error(f"Error deleting messages in chat {chat_id}: {e}")
     finally:
         message_pairs.pop(chat_id, None)
+        search_cache.pop(chat_id, None)
+        search_cache_expiry.pop(chat_id, None)
+
+# Feedback command handler
+@app.on_message(filters.command("feedback"))
+async def feedback_command(client: Client, message: Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if len(message.command) < 2:
+        await queue_message(message.reply, "Please provide your feedback. Usage: /feedback <your feedback>")
+        return
+
+    feedback = " ".join(message.command[1:])
+    await log_to_channel(client, f"Feedback from user {user_id} in chat {chat_id}: {feedback}")
+    await queue_message(message.reply, "Thank you for your feedback! It has been sent to the admins.")
 
 # Help command handler
 @app.on_message(filters.command("help"))
@@ -200,6 +223,7 @@ async def help_command(client: Client, message: Message):
         "• Use `/start` to begin.\n"
         "• Search for files by typing a keyword (e.g., 'movie').\n"
         "• If prompted, join the required channels to proceed.\n"
+        "• Use `/feedback <message>` to send feedback to admins.\n"
         "• Admins can use commands like `/add_db`, `/stats`, etc. (see Admin Menu).\n"
         "━━━━━━━━━━━━━━\n"
         "Need more help? Contact an admin!"
@@ -241,10 +265,12 @@ async def start(client: Client, message: Message):
             "/add_db - Add a DB channel\n"
             "/add_sub - Add a subscription channel\n"
             "/stats - View bot statistics\n"
+            "/user_stats - View user activity statistics\n"
             "/broadcast - Broadcast a message\n"
             "/remove_channel - Remove a channel\n"
             "/admin_list - View admin list\n"
             "/set_logchannel - Set a log channel\n"
+            "/set_rate_limit - Adjust rate limiting settings\n"
             "/clear_logs - Clear logs in log channel\n"
             "━━━━━━━━━━━━━━\n"
             "Enter the command to proceed (password required)."
@@ -254,7 +280,7 @@ async def start(client: Client, message: Message):
         await queue_message(message.reply, "Hi!\nSend me a keyword to search for files, or use /help for guidance.")
 
 # Handle admin commands
-@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
+@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_admin_commands(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
@@ -275,12 +301,24 @@ async def handle_admin_commands(client: Client, message: Message):
         await queue_message(message.reply, "Forward a message from the channel you want to set as the log channel (bot must be admin).")
         return
 
+    if command == "set_rate_limit":
+        admin_pending_action[user_id] = "set_rate_limit"
+        await queue_message(message.reply, "Please provide the new rate limit settings in the format: max_messages min_delay (e.g., 15 1.5)")
+        return
+
+    if command == "user_stats":
+        stats_text = "📊 User Activity Statistics\n━━━━━━━━━━━━━━\n"
+        for uid, count in user_search_counts.items():
+            stats_text += f"User ID: {uid}, Searches: {count}\n"
+        stats_text += "━━━━━━━━━━━━━━"
+        await queue_message(message.reply, stats_text)
+        return
+
     if command == "clear_logs":
         if log_channel is None:
             await queue_message(message.reply, "❌ No log channel set. Use /set_logchannel to set one.")
             return
         try:
-            # Delete all messages in the log channel (up to 100 at a time)
             async for msg in client.get_chat_history(log_channel, limit=100):
                 await client.delete_messages(log_channel, msg.id)
             await queue_message(message.reply, "✅ Logs cleared in the log channel.")
@@ -294,20 +332,21 @@ async def handle_admin_commands(client: Client, message: Message):
     await queue_message(message.reply, "🔒 Please enter the admin password to proceed:")
 
 # Handle text queries (works in both private and group chats)
-@app.on_message(filters.text & ~filters.command(["start", "help", "add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
+@app.on_message(filters.text & ~filters.command(["start", "help", "feedback", "add_db", "add_sub", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
-    query = message.text.strip()
+    query = message.text.strip().lower()  # Normalize query to lowercase
 
     # Prevent duplicate processing of the same message
     if chat_id in message_pairs:
         logger.warning(f"Duplicate query detected in chat {chat_id}, ignoring.")
         return
 
-    # Log the search query and add to history
+    # Log the search query, update history, and count
     await log_to_channel(client, f"User {user_id} searched for: '{query}' in chat {chat_id}")
     user_search_history[user_id].append((query, time.time()))
+    user_search_counts[user_id] += 1
 
     # Check if the message is a password response for admin (only in private chats)
     if chat_id > 0 and user_id in admin_list and user_id in admin_pending_action:
@@ -335,6 +374,20 @@ async def handle_query(client: Client, message: Message):
                 await queue_message(message.reply, "Select channel to remove:", reply_markup=InlineKeyboardMarkup(buttons))
             elif action == "broadcast":
                 await queue_message(message.reply, "Please send the message you want to broadcast to all groups.")
+            elif action == "set_rate_limit":
+                try:
+                    max_msgs, min_delay = map(float, query.split())
+                    if max_msgs < 1 or min_delay < 0.5:
+                        await queue_message(message.reply, "❌ Invalid values. max_messages must be >= 1, min_delay must be >= 0.5")
+                        return
+                    global RATE_LIMIT_MAX_MESSAGES, MIN_MESSAGE_DELAY
+                    RATE_LIMIT_MAX_MESSAGES = int(max_msgs)
+                    MIN_MESSAGE_DELAY = min_delay
+                    message_timestamps.maxlen = RATE_LIMIT_MAX_MESSAGES
+                    await queue_message(message.reply, f"✅ Rate limits updated: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY}")
+                    await log_to_channel(client, f"Admin {user_id} updated rate limits: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY}")
+                except ValueError:
+                    await queue_message(message.reply, "❌ Invalid format. Please use: max_messages min_delay (e.g., 15 1.5)")
             elif action.startswith("add_db_forward_") or action.startswith("add_sub_forward_"):
                 channel_type, _, channel_id = action.split("_")[1:4]
                 channel_id = int(channel_id)
@@ -386,68 +439,83 @@ async def handle_query(client: Client, message: Message):
     searching_msg = await message.reply("🔍 Searching in database channels...")
     message_pairs[chat_id] = (message.id, searching_msg.id)
 
-    # Search channels concurrently
-    results = []
-    async def search_channel(channel_id: int):
+    # Check if results are in cache
+    now = time.time()
+    if chat_id in search_cache and chat_id in search_cache_expiry and now < search_cache_expiry[chat_id]:
+        results = search_cache[chat_id]
+        await log_to_channel(client, f"User {user_id} used cached results for query: '{query}'")
+    else:
+        # Search channels concurrently
+        results = []
+        async def search_channel(channel_id: int):
+            try:
+                if not await check_bot_privileges(client, channel_id, require_admin=False):
+                    logger.warning(f"Bot lacks access to channel {channel_id}")
+                    return
+
+                # Search for messages matching the query
+                async for msg in client.search_messages(chat_id=channel_id, query=query, limit=SEARCH_LIMIT):
+                    # Check if the message is a document or has a caption matching the query
+                    if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
+                        file_name = msg.document.file_name or "Unnamed File"
+                        # Also check caption for broader matching
+                        caption = msg.caption.lower() if msg.caption else ""
+                        if query in file_name.lower() or query in caption:
+                            results.append({
+                                "file_name": file_name,
+                                "file_size": round(msg.document.file_size / (1024 * 1024), 2),
+                                "file_id": msg.document.file_id,
+                                "msg_id": msg.id,
+                                "channel_id": channel_id
+                            })
+                            logger.info(f"Match found in channel {channel_id}: {file_name}")
+                    else:
+                        # Log if a message doesn't match the criteria
+                        logger.debug(f"Message {msg.id} in channel {channel_id} is not a document or doesn't match query")
+            except errors.ChannelPrivate:
+                logger.error(f"Channel {channel_id} is private or bot lacks access")
+                db_channels.discard(channel_id)
+            except Exception as e:
+                await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
+                logger.error(f"Search error in channel {channel_id}: {e}")
+
         try:
-            if not await check_bot_privileges(client, channel_id, require_admin=False):
-                logger.warning(f"Bot lacks access to channel {channel_id}")
+            tasks = [search_channel(channel_id) for channel_id in db_channels]
+            await asyncio.gather(*tasks)
+
+            if not results:
+                await queue_message(searching_msg.edit, "No files found in the database channels.")
+                await log_to_channel(client, f"No matches found for query '{query}' in chat {chat_id}")
                 return
 
-            async for msg in client.search_messages(
-                chat_id=channel_id,
-                query=query,
-                limit=SEARCH_LIMIT
-            ):
-                if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
-                    results.append({
-                        "file_name": msg.document.file_name or "Unnamed File",
-                        "file_size": round(msg.document.file_size / (1024 * 1024), 2),
-                        "file_id": msg.document.file_id,
-                        "msg_id": msg.id,
-                        "channel_id": channel_id
-                    })
-        except errors.ChannelPrivate:
-            logger.error(f"Channel {channel_id} is private or bot lacks access")
-            db_channels.discard(channel_id)
-        except Exception as e:
-            await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
-            logger.error(f"Search error in channel {channel_id}: {e}")
+            # Cache the results
+            search_cache[chat_id] = results
+            search_cache_expiry[chat_id] = now + CACHE_DURATION
 
-    try:
-        tasks = [search_channel(channel_id) for channel_id in db_channels]
-        await asyncio.gather(*tasks)
+    # Display results (first page)
+    pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
+    page_num = 1
+    page = pages[page_num - 1]  # First page
+    buttons = []
+    for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
+        dyn_id = generate_dynamic_id()
+        button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
+    buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
+    if len(pages) > 1:
+        nav_buttons = []
+        if page_num < len(pages):
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
+        buttons.append(nav_buttons)
 
-        if not results:
-            await queue_message(searching_msg.edit, "No files found in the database channels.")
-            return
-
-        # Update searching message with results count
-        await queue_message(searching_msg.edit, f"✅ Found {len(results)} file(s) matching your query.")
-
-        # Paginate results, but only send the first page initially
-        pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
-        page_num = 1
-        page = pages[page_num - 1]  # First page
-        buttons = []
-        for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
-            dyn_id = generate_dynamic_id()
-            button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
-            buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
-        buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
-        if len(pages) > 1:
-            nav_buttons = []
-            if page_num < len(pages):
-                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
-            buttons.append(nav_buttons)
-        response = await message.reply(f"📂 Search Results (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
-        message_pairs[chat_id] = (message.id, response.id)
-        asyncio.create_task(delete_messages_later(client, chat_id, message.id, response.id))
-    except Exception as e:
-        await queue_message(searching_msg.edit, "❌ An error occurred while searching. Please try again.")
-        await log_to_channel(client, f"Error in search for user {user_id}: {str(e)}")
-        logger.error(f"Error in search: {e}")
-        message_pairs.pop(chat_id, None)
+    # Edit the searching message to show results
+    await queue_message(
+        searching_msg.edit,
+        f"✅ Found {len(results)} file(s) matching your query.\n\n📂 Search Results (Page {page_num}/{len(pages)}):",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    message_pairs[chat_id] = (message.id, searching_msg.id)
+    asyncio.create_task(delete_messages_later(client, chat_id, message.id, searching_msg.id))
 
 # Callback query handler
 @app.on_callback_query()
@@ -479,23 +547,43 @@ async def handle_callbacks(client: Client, callback_query):
 
         elif data.startswith("get_"):
             _, channel_id, msg_id, _ = data.split("_", 3)
+            channel_id = int(channel_id)
+            msg_id = int(msg_id)
 
-            if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
-                buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
-                buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
-                await queue_message(callback_query.message.reply, "Please join the required channels:", reply_markup=InlineKeyboardMarkup(buttons))
-                return
+            # Log subscription check
+            if chat_id > 0 and force_sub_channels:
+                sub_status = await check_subscription(client, user_id, chat_id)
+                await log_to_channel(client, f"Subscription check for user {user_id} in chat {chat_id}: {sub_status}")
+                if not sub_status:
+                    buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
+                    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
+                    await queue_message(callback_query.message.reply, "Please join the required channels:", reply_markup=InlineKeyboardMarkup(buttons))
+                    return
 
+            # Log verification status
             verified_time = verified_users.get(user_id, 0)
             now = time.time()
             use_shortener = now - verified_time > VERIFICATION_DURATION
+            await log_to_channel(client, f"Verification status for user {user_id}: use_shortener={use_shortener}, verified_time={verified_time}, now={now}")
 
-            file_link = f"https://t.me/c/{str(channel_id)[4:]}/{msg_id}"
+            # Generate the file link
+            # Ensure channel_id is correctly formatted (remove -100 prefix)
+            channel_id_str = str(channel_id)
+            if channel_id_str.startswith("-100"):
+                channel_id_str = channel_id_str[4:]
+            else:
+                await log_to_channel(client, f"Invalid channel_id format for link generation: {channel_id}")
+                await callback_query.answer("Error generating file link. Please try again.", show_alert=True)
+                return
+
+            file_link = f"https://t.me/c/{channel_id_str}/{msg_id}"
+            await log_to_channel(client, f"Generated file link for user {user_id}: {file_link}")
+
             if use_shortener:
                 file_link = await shorten_link(file_link)
                 await queue_message(
                     callback_query.message.reply,
-                    "ℹ️ Type movie name: hello and get your files like this\n🔗 Link generated with shortening:",
+                    f"ℹ️ Type movie name: hello and get your files like this\n🔗 Link generated with shortening:\n{file_link}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⬇️ Download", url=file_link)],
                         [InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")]
@@ -505,7 +593,7 @@ async def handle_callbacks(client: Client, callback_query):
             else:
                 await queue_message(
                     callback_query.message.reply,
-                    "ℹ️ Type movie name: hello and get your files like this\n📥 Direct download link:",
+                    f"ℹ️ Type movie name: hello and get your files like this\n📥 Direct download link:\n{file_link}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⬇️ Download", url=file_link)],
                         [InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")]
@@ -515,33 +603,13 @@ async def handle_callbacks(client: Client, callback_query):
 
         elif data.startswith("page_"):
             page_num = int(data.split("_")[1])
-            # Recompute results (simplified; in a real app, you'd cache the results)
-            query = user_search_history[user_id][-1][0] if user_search_history[user_id] else ""
-            results = []
-            async def search_channel(channel_id: int):
-                try:
-                    if not await check_bot_privileges(client, channel_id, require_admin=False):
-                        logger.warning(f"Bot lacks access to channel {channel_id}")
-                        return
-                    async for msg in client.search_messages(chat_id=channel_id, query=query, limit=SEARCH_LIMIT):
-                        if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
-                            results.append({
-                                "file_name": msg.document.file_name or "Unnamed File",
-                                "file_size": round(msg.document.file_size / (1024 * 1024), 2),
-                                "file_id": msg.document.file_id,
-                                "msg_id": msg.id,
-                                "channel_id": channel_id
-                            })
-                except errors.ChannelPrivate:
-                    logger.error(f"Channel {channel_id} is private or bot lacks access")
-                    db_channels.discard(channel_id)
-                except Exception as e:
-                    await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
-                    logger.error(f"Search error in channel {channel_id}: {e}")
+            # Use cached results if available
+            now = time.time()
+            if chat_id not in search_cache or chat_id not in search_cache_expiry or now >= search_cache_expiry[chat_id]:
+                await callback_query.answer("Search results have expired. Please search again.", show_alert=True)
+                return
 
-            tasks = [search_channel(channel_id) for channel_id in db_channels]
-            await asyncio.gather(*tasks)
-
+            results = search_cache[chat_id]
             pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
             if page_num < 1 or page_num > len(pages):
                 await callback_query.answer("Invalid page number.", show_alert=True)
@@ -561,7 +629,11 @@ async def handle_callbacks(client: Client, callback_query):
                 nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
             if nav_buttons:
                 buttons.append(nav_buttons)
-            await queue_message(callback_query.message.edit, f"📂 Search Results (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
+            await queue_message(
+                callback_query.message.edit,
+                f"📂 Search Results (Page {page_num}/{len(pages)}):",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
         # Admin actions with password prompt
         elif data in ["add_db", "add_sub", "stats", "remove_channel"] and user_id in admin_list:
@@ -631,7 +703,7 @@ async def add_channel(client: Client, message: Message):
     await log_to_channel(client, f"Admin {user_id} forwarded a message to add channel {chat.id}")
 
 # Handle broadcast message after password verification
-@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|add_db$|add_sub$|stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|clear_logs$).+"))
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|/feedback$|add_db$|add_sub$|stats$|user_stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|set_rate_limit$|clear_logs$).+"))
 async def handle_broadcast_message(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
