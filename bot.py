@@ -37,6 +37,8 @@ db_channels: Set[int] = set()  # Dynamic DB channels
 force_sub_channels: Set[int] = set()  # Forced subscription channels
 message_pairs: Dict[int, tuple] = {}  # chat_id: (request_msg_id, response_msg_id)
 admin_pending_action: Dict[int, str] = {}  # user_id: pending admin action
+admin_batch_keywords: Dict[int, str] = {}  # user_id: batch keyword (for genbatch/editbatch)
+batches: Dict[str, Dict] = {}  # keyword: {"channel_id": int, "msg_ids": List[int]}
 admin_list: Set[int] = {ADMIN_ID}  # Set of admin IDs (starting with the main admin)
 log_channel: Optional[int] = None  # Log channel ID (set by admin)
 user_search_history: Dict[int, Deque[Tuple[str, float]]] = defaultdict(lambda: deque(maxlen=5))  # user_id: [(query, timestamp)]
@@ -264,6 +266,8 @@ async def start(client: Client, message: Message):
             "Available Commands:\n"
             "/add_db - Add a DB channel\n"
             "/add_sub - Add a subscription channel\n"
+            "/genbatch - Generate a new batch of files\n"
+            "/editbatch - Edit an existing batch of files\n"
             "/stats - View bot statistics\n"
             "/user_stats - View user activity statistics\n"
             "/broadcast - Broadcast a message\n"
@@ -280,7 +284,7 @@ async def start(client: Client, message: Message):
         await queue_message(message.reply, "Hi!\nSend me a keyword to search for files, or use /help for guidance.")
 
 # Handle admin commands
-@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
+@app.on_message(filters.private & filters.command(["add_db", "add_sub", "genbatch", "editbatch", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_admin_commands(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
@@ -304,6 +308,19 @@ async def handle_admin_commands(client: Client, message: Message):
     if command == "set_rate_limit":
         admin_pending_action[user_id] = "set_rate_limit"
         await queue_message(message.reply, "Please provide the new rate limit settings in the format: max_messages min_delay (e.g., 15 1.5)")
+        return
+
+    if command == "genbatch":
+        admin_pending_action[user_id] = "genbatch_keyword"
+        await queue_message(message.reply, "Please provide the keyword for this batch:")
+        return
+
+    if command == "editbatch":
+        if not batches:
+            await queue_message(message.reply, "❌ No batches exist. Create a batch using /genbatch first.")
+            return
+        admin_pending_action[user_id] = "editbatch_keyword"
+        await queue_message(message.reply, "Please provide the keyword of the batch you want to edit:")
         return
 
     if command == "user_stats":
@@ -332,7 +349,7 @@ async def handle_admin_commands(client: Client, message: Message):
     await queue_message(message.reply, "🔒 Please enter the admin password to proceed:")
 
 # Handle text queries (works in both private and group chats)
-@app.on_message(filters.text & ~filters.command(["start", "help", "feedback", "add_db", "add_sub", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
+@app.on_message(filters.text & ~filters.command(["start", "help", "feedback", "add_db", "add_sub", "genbatch", "editbatch", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -363,6 +380,7 @@ async def handle_query(client: Client, message: Message):
                     f"Users: {len(verified_users)}\n"
                     f"DB Channels: {len(db_channels)}\n"
                     f"Sub Channels: {len(force_sub_channels)}\n"
+                    f"Batches: {len(batches)}\n"
                     f"━━━━━━━━━━━━━━"
                 )
                 await queue_message(message.reply, stats)
@@ -418,6 +436,48 @@ async def handle_query(client: Client, message: Message):
             admin_pending_action.pop(user_id, None)
         return
 
+    # Handle genbatch/editbatch keyword input
+    if chat_id > 0 and user_id in admin_list and user_id in admin_pending_action:
+        if admin_pending_action[user_id] == "genbatch_keyword":
+            if not query:
+                await queue_message(message.reply, "❌ Please provide a valid keyword.")
+                return
+            admin_batch_keywords[user_id] = query.lower()
+            admin_pending_action[user_id] = "genbatch_files"
+            await queue_message(
+                message.reply,
+                "Please send the files for this batch. When you're done, type 'Done' or use the button below.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="genbatch_done")]])
+            )
+            return
+        elif admin_pending_action[user_id] == "editbatch_keyword":
+            if not query:
+                await queue_message(message.reply, "❌ Please provide a valid keyword.")
+                return
+            keyword = query.lower()
+            if keyword not in batches:
+                await queue_message(message.reply, f"❌ No batch found with keyword '{keyword}'. Create a batch using /genbatch first.")
+                admin_pending_action.pop(user_id, None)
+                return
+            admin_batch_keywords[user_id] = keyword
+            admin_pending_action[user_id] = "editbatch_files"
+            await queue_message(
+                message.reply,
+                "Please send the new files for this batch. When you're done, type 'Done' or use the button below.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="editbatch_done")]])
+            )
+            return
+        elif admin_pending_action[user_id] in ("genbatch_files", "editbatch_files") and query.lower() == "done":
+            if admin_pending_action[user_id] == "genbatch_files":
+                await queue_message(message.reply, "✅ Batch creation completed.")
+                await log_to_channel(client, f"Admin {user_id} completed batch creation for keyword '{admin_batch_keywords[user_id]}'")
+            else:
+                await queue_message(message.reply, "✅ Batch edit completed.")
+                await log_to_channel(client, f"Admin {user_id} completed batch edit for keyword '{admin_batch_keywords[user_id]}'")
+            admin_pending_action.pop(user_id, None)
+            admin_batch_keywords.pop(user_id, None)
+            return
+
     # Check subscription (only in private chats)
     if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
         buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
@@ -439,64 +499,94 @@ async def handle_query(client: Client, message: Message):
     searching_msg = await message.reply("🔍 Searching in database channels...")
     message_pairs[chat_id] = (message.id, searching_msg.id)
 
-    # Check if results are in cache
-    now = time.time()
-    if chat_id in search_cache and chat_id in search_cache_expiry and now < search_cache_expiry[chat_id]:
-        results = search_cache[chat_id]
-        await log_to_channel(client, f"User {user_id} used cached results for query: '{query}'")
-    else:
-        # Search channels concurrently
-        results = []
-        async def search_channel(channel_id: int):
+    # Check if query matches a batch
+    batch_results = []
+    matched_keyword = None
+    for keyword in batches:
+        if query in keyword or keyword in query:  # Partial match
+            matched_keyword = keyword
+            batch = batches[keyword]
+            channel_id = batch["channel_id"]
+            msg_ids = batch["msg_ids"]
             try:
-                if not await check_bot_privileges(client, channel_id, require_admin=False):
-                    logger.warning(f"Bot lacks access to channel {channel_id}")
-                    return
-
-                # Search for messages matching the query
-                async for msg in client.search_messages(chat_id=channel_id, query=query, limit=SEARCH_LIMIT):
-                    # Check if the message is a document or has a caption matching the query
+                for msg_id in msg_ids:
+                    msg = await client.get_messages(channel_id, msg_id)
                     if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
                         file_name = msg.document.file_name or "Unnamed File"
-                        # Also check caption for broader matching
-                        caption = msg.caption.lower() if msg.caption else ""
-                        if query in file_name.lower() or query in caption:
-                            results.append({
-                                "file_name": file_name,
-                                "file_size": round(msg.document.file_size / (1024 * 1024), 2),
-                                "file_id": msg.document.file_id,
-                                "msg_id": msg.id,
-                                "channel_id": channel_id
-                            })
-                            logger.info(f"Match found in channel {channel_id}: {file_name}")
-                    else:
-                        # Log if a message doesn't match the criteria
-                        logger.debug(f"Message {msg.id} in channel {channel_id} is not a document or doesn't match query")
-            except errors.ChannelPrivate:
-                logger.error(f"Channel {channel_id} is private or bot lacks access")
-                db_channels.discard(channel_id)
+                        batch_results.append({
+                            "file_name": file_name,
+                            "file_size": round(msg.document.file_size / (1024 * 1024), 2),
+                            "file_id": msg.document.file_id,
+                            "msg_id": msg.id,
+                            "channel_id": channel_id
+                        })
             except Exception as e:
-                await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
-                logger.error(f"Search error in channel {channel_id}: {e}")
+                await log_to_channel(client, f"Error fetching batch files for keyword '{keyword}': {str(e)}")
+                continue
+            break
 
-        try:
-            tasks = [search_channel(channel_id) for channel_id in db_channels]
-            await asyncio.gather(*tasks)
+    if batch_results:
+        await log_to_channel(client, f"User {user_id} found batch match for query '{query}' with keyword '{matched_keyword}'")
+        results = batch_results
+    else:
+        # Check if results are in cache
+        now = time.time()
+        if chat_id in search_cache and chat_id in search_cache_expiry and now < search_cache_expiry[chat_id]:
+            results = search_cache[chat_id]
+            await log_to_channel(client, f"User {user_id} used cached results for query: '{query}'")
+        else:
+            # Search channels concurrently
+            results = []
+            async def search_channel(channel_id: int):
+                try:
+                    if not await check_bot_privileges(client, channel_id, require_admin=False):
+                        logger.warning(f"Bot lacks access to channel {channel_id}")
+                        return
 
-            if not results:
-                await queue_message(searching_msg.edit, "No files found in the database channels.")
-                await log_to_channel(client, f"No matches found for query '{query}' in chat {chat_id}")
+                    # Search for messages matching the query
+                    async for msg in client.search_messages(chat_id=channel_id, query=query, limit=SEARCH_LIMIT):
+                        # Check if the message is a document or has a caption matching the query
+                        if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
+                            file_name = msg.document.file_name or "Unnamed File"
+                            # Also check caption for broader matching
+                            caption = msg.caption.lower() if msg.caption else ""
+                            if query in file_name.lower() or query in caption:
+                                results.append({
+                                    "file_name": file_name,
+                                    "file_size": round(msg.document.file_size / (1024 * 1024), 2),
+                                    "file_id": msg.document.file_id,
+                                    "msg_id": msg.id,
+                                    "channel_id": channel_id
+                                })
+                                logger.info(f"Match found in channel {channel_id}: {file_name}")
+                        else:
+                            # Log if a message doesn't match the criteria
+                            logger.debug(f"Message {msg.id} in channel {channel_id} is not a document or doesn't match query")
+                except errors.ChannelPrivate:
+                    logger.error(f"Channel {channel_id} is private or bot lacks access")
+                    db_channels.discard(channel_id)
+                except Exception as e:
+                    await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
+                    logger.error(f"Search error in channel {channel_id}: {e}")
+
+            try:
+                tasks = [search_channel(channel_id) for channel_id in db_channels]
+                await asyncio.gather(*tasks)
+
+                if not results:
+                    await queue_message(searching_msg.edit, "No files found in the database channels.")
+                    await log_to_channel(client, f"No matches found for query '{query}' in chat {chat_id}")
+                    return
+
+                # Cache the results
+                search_cache[chat_id] = results
+                search_cache_expiry[chat_id] = now + CACHE_DURATION
+            except Exception as e:
+                await queue_message(searching_msg.edit, "❌ An error occurred while searching. Please try again.")
+                await log_to_channel(client, f"Search error for user {user_id} in chat {chat_id}: {str(e)}")
+                logger.error(f"Search error: {e}")
+                message_pairs.pop(chat_id, None)
                 return
-
-            # Cache the results
-            search_cache[chat_id] = results
-            search_cache_expiry[chat_id] = now + CACHE_DURATION
-        except Exception as e:
-            await queue_message(searching_msg.edit, "❌ An error occurred while searching. Please try again.")
-            await log_to_channel(client, f"Search error for user {user_id} in chat {chat_id}: {str(e)}")
-            logger.error(f"Search error: {e}")
-            message_pairs.pop(chat_id, None)
-            return
 
     # Display results (first page)
     pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
@@ -522,6 +612,79 @@ async def handle_query(client: Client, message: Message):
     )
     message_pairs[chat_id] = (message.id, searching_msg.id)
     asyncio.create_task(delete_messages_later(client, chat_id, message.id, searching_msg.id))
+
+# Handle media messages (for genbatch/editbatch)
+@app.on_message(filters.private & (filters.document | filters.photo | filters.video | filters.audio))
+async def handle_media(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in admin_list or user_id not in admin_pending_action:
+        return
+
+    if admin_pending_action[user_id] not in ("genbatch_files", "editbatch_files"):
+        return
+
+    # Check if a database channel exists
+    if not db_channels:
+        await queue_message(message.reply, "❌ No database channel found. Please add one using /add_db first.")
+        admin_pending_action.pop(user_id, None)
+        admin_batch_keywords.pop(user_id, None)
+        return
+
+    # Select the first available database channel
+    channel_id = next(iter(db_channels))
+    keyword = admin_batch_keywords[user_id]
+
+    try:
+        # If editing a batch, delete the old files
+        if admin_pending_action[user_id] == "editbatch_files":
+            if keyword in batches:
+                old_batch = batches[keyword]
+                old_channel_id = old_batch["channel_id"]
+                old_msg_ids = old_batch["msg_ids"]
+                try:
+                    await client.delete_messages(old_channel_id, old_msg_ids)
+                    await log_to_channel(client, f"Admin {user_id} deleted old files for batch '{keyword}' in channel {old_channel_id}")
+                except Exception as e:
+                    await log_to_channel(client, f"Error deleting old files for batch '{keyword}': {str(e)}")
+                # Clear the old message IDs
+                batches[keyword]["msg_ids"] = []
+            else:
+                await queue_message(message.reply, "❌ Batch not found. Please start over with /editbatch.")
+                admin_pending_action.pop(user_id, None)
+                admin_batch_keywords.pop(user_id, None)
+                return
+
+        # Upload the file to the database channel
+        caption = f"Batch: {keyword}"
+        if message.document:
+            sent_msg = await client.send_document(channel_id, message.document.file_id, caption=caption)
+        elif message.photo:
+            sent_msg = await client.send_photo(channel_id, message.photo.file_id, caption=caption)
+        elif message.video:
+            sent_msg = await client.send_video(channel_id, message.video.file_id, caption=caption)
+        elif message.audio:
+            sent_msg = await client.send_audio(channel_id, message.audio.file_id, caption=caption)
+        else:
+            await queue_message(message.reply, "❌ Unsupported file type.")
+            return
+
+        # Store the message ID in the batch
+        if keyword not in batches:
+            batches[keyword] = {"channel_id": channel_id, "msg_ids": []}
+        batches[keyword]["msg_ids"].append(sent_msg.id)
+        await log_to_channel(client, f"Admin {user_id} added file to batch '{keyword}' in channel {channel_id}, msg_id: {sent_msg.id}")
+
+        await queue_message(
+            message.reply,
+            "✅ File added to the batch. Send more files or type 'Done' to finish.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Done", callback_data="genbatch_done" if admin_pending_action[user_id] == "genbatch_files" else "editbatch_done")]])
+        )
+
+    except Exception as e:
+        await queue_message(message.reply, "❌ Error uploading file to the database channel.")
+        await log_to_channel(client, f"Error uploading file for batch '{keyword}' by admin {user_id}: {str(e)}")
+        admin_pending_action.pop(user_id, None)
+        admin_batch_keywords.pop(user_id, None)
 
 # Callback query handler
 @app.on_callback_query()
@@ -550,6 +713,18 @@ async def handle_callbacks(client: Client, callback_query):
                 history_text += f"{idx}. '{query}' at {time_str}\n"
             history_text += "━━━━━━━━━━━━━━"
             await queue_message(callback_query.message.reply, history_text)
+
+        elif data == "genbatch_done" and user_id in admin_list and admin_pending_action.get(user_id) == "genbatch_files":
+            await queue_message(callback_query.message.reply, "✅ Batch creation completed.")
+            await log_to_channel(client, f"Admin {user_id} completed batch creation for keyword '{admin_batch_keywords[user_id]}'")
+            admin_pending_action.pop(user_id, None)
+            admin_batch_keywords.pop(user_id, None)
+
+        elif data == "editbatch_done" and user_id in admin_list and admin_pending_action.get(user_id) == "editbatch_files":
+            await queue_message(callback_query.message.reply, "✅ Batch edit completed.")
+            await log_to_channel(client, f"Admin {user_id} completed batch edit for keyword '{admin_batch_keywords[user_id]}'")
+            admin_pending_action.pop(user_id, None)
+            admin_batch_keywords.pop(user_id, None)
 
         elif data.startswith("get_"):
             _, channel_id, msg_id, _ = data.split("_", 3)
@@ -709,7 +884,7 @@ async def add_channel(client: Client, message: Message):
     await log_to_channel(client, f"Admin {user_id} forwarded a message to add channel {chat.id}")
 
 # Handle broadcast message after password verification
-@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|/feedback$|add_db$|add_sub$|stats$|user_stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|set_rate_limit$|clear_logs$).+"))
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|/feedback$|add_db$|add_sub$|genbatch$|editbatch$|stats$|user_stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|set_rate_limit$|clear_logs$).+"))
 async def handle_broadcast_message(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
