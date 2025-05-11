@@ -491,6 +491,12 @@ async def handle_query(client: Client, message: Message):
             # Cache the results
             search_cache[chat_id] = results
             search_cache_expiry[chat_id] = now + CACHE_DURATION
+        except Exception as e:
+            await queue_message(searching_msg.edit, "❌ An error occurred while searching. Please try again.")
+            await log_to_channel(client, f"Search error for user {user_id} in chat {chat_id}: {str(e)}")
+            logger.error(f"Search error: {e}")
+            message_pairs.pop(chat_id, None)
+            return
 
     # Display results (first page)
     pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
