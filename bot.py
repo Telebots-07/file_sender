@@ -1,12 +1,12 @@
 import asyncio
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, ChatMember
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, MessageMediaType
 import time
 import os
 from datetime import datetime, timedelta
-from collections import defaultdict
-from typing import Dict, Set, Optional
+from collections import defaultdict, deque
+from typing import Dict, Set, Optional, Deque, Tuple
 import random
 import string
 import aiohttp
@@ -34,12 +34,13 @@ app = Client("file-request-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT
 verified_users: Dict[int, float] = defaultdict(float)  # user_id: verification timestamp
 db_channels: Set[int] = set()  # Dynamic DB channels
 force_sub_channels: Set[int] = set()  # Forced subscription channels
-cover_photos: Dict[str, str] = {}  # File name to cover photo file_id
 message_pairs: Dict[int, tuple] = {}  # chat_id: (request_msg_id, response_msg_id)
 admin_pending_action: Dict[int, str] = {}  # user_id: pending admin action
 admin_list: Set[int] = {ADMIN_ID}  # Set of admin IDs (starting with the main admin)
 log_channel: Optional[int] = None  # Log channel ID (set by admin)
 last_message_time: float = 0  # For rate limiting
+user_search_history: Dict[int, Deque[Tuple[str, float]]] = defaultdict(lambda: deque(maxlen=5))  # user_id: [(query, timestamp)]
+start_ids: Dict[int, str] = {}  # user_id: start_id
 
 # Constants
 SEARCH_LIMIT = 50
@@ -49,7 +50,7 @@ DELETE_DELAY = 600  # 10 minutes in seconds
 ADMIN_PASSWORD = "12122"
 MESSAGE_DELAY = 0.5  # Delay in seconds between messages to prevent flooding
 
-# Helper: Generate dynamic ID for callbacks
+# Helper: Generate dynamic ID for callbacks and start IDs
 def generate_dynamic_id(length: int = 10) -> str:
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
@@ -148,8 +149,10 @@ async def start(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    # Log the /start command
-    await log_to_channel(client, f"User {user_id} used /start in chat {chat_id}")
+    # Generate a unique start ID for each /start command
+    start_id = generate_dynamic_id()
+    start_ids[user_id] = start_id
+    await log_to_channel(client, f"User {user_id} used /start in chat {chat_id} with Start ID: {start_id}")
 
     # Check subscription (only in private chats)
     if chat_id > 0 and force_sub_channels and not await check_subscription(client, user_id, chat_id):
@@ -161,9 +164,12 @@ async def start(client: Client, message: Message):
 
     # Welcome message for new users (only in private chats)
     if chat_id > 0:
+        buttons = [
+            [InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")],
+            [InlineKeyboardButton("🕒 Recent Searches", callback_data="view_history")]
+        ]
         await rate_limit_message()
-        await client.send_message(user_id, "Welcome! Search for files by typing a keyword.\nClick below for download instructions:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")]]))
+        await client.send_message(user_id, f"Welcome! Your Start ID: {start_id}\nSearch for files by typing a keyword.", reply_markup=InlineKeyboardMarkup(buttons))
 
     # Admin menu (text-based with "three lines" style, only in private chats)
     if chat_id > 0 and user_id in admin_list:
@@ -176,19 +182,19 @@ async def start(client: Client, message: Message):
             "/add_sub - Add a subscription channel\n"
             "/stats - View bot statistics\n"
             "/broadcast - Broadcast a message\n"
-            "/set_cover - Set a cover photo\n"
             "/remove_channel - Remove a channel\n"
             "/admin_list - View admin list\n"
             "/set_logchannel - Set a log channel\n"
+            "/clear_logs - Clear logs in log channel\n"
             "━━━━━━━━━━━━━━\n"
             "Enter the command to proceed (password required)."
         )
     else:
         await rate_limit_message()
-        await message.reply("Hi! Send me a keyword to search for files.")
+        await message.reply(f"Hi! Your Start ID: {start_id}\nSend me a keyword to search for files.")
 
 # Handle admin commands
-@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "set_cover", "remove_channel", "admin_list", "set_logchannel"]))
+@app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
 async def handle_admin_commands(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
@@ -212,19 +218,38 @@ async def handle_admin_commands(client: Client, message: Message):
         await message.reply("Forward a message from the channel you want to set as the log channel (bot must be admin).")
         return
 
+    if command == "clear_logs":
+        if log_channel is None:
+            await rate_limit_message()
+            await message.reply("❌ No log channel set. Use /set_logchannel to set one.")
+            return
+        try:
+            # Delete all messages in the log channel (up to 100 at a time)
+            async for msg in client.get_chat_history(log_channel, limit=100):
+                await client.delete_messages(log_channel, msg.id)
+            await rate_limit_message()
+            await message.reply("✅ Logs cleared in the log channel.")
+            await log_to_channel(client, f"Admin {user_id} cleared logs in log channel {log_channel}")
+        except Exception as e:
+            await rate_limit_message()
+            await message.reply("❌ Error clearing logs.")
+            await log_to_channel(client, f"Error clearing logs in log channel {log_channel}: {str(e)}")
+        return
+
     admin_pending_action[user_id] = command
     await rate_limit_message()
     await message.reply("🔒 Please enter the admin password to proceed:")
 
 # Handle text queries (works in both private and group chats)
-@app.on_message(filters.text & ~filters.command(["start", "add_db", "add_sub", "stats", "broadcast", "set_cover", "remove_channel", "admin_list", "set_logchannel"]))
+@app.on_message(filters.text & ~filters.command(["start", "add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     query = message.text.strip()
 
-    # Log the search query
+    # Log the search query and add to history
     await log_to_channel(client, f"User {user_id} searched for: '{query}' in chat {chat_id}")
+    user_search_history[user_id].append((query, time.time()))
 
     # Check if the message is a password response for admin (only in private chats)
     if chat_id > 0 and user_id in admin_list and user_id in admin_pending_action:
@@ -236,9 +261,6 @@ async def handle_query(client: Client, message: Message):
             elif action == "add_sub":
                 await rate_limit_message()
                 await message.reply("Forward a message from the subscription channel you want to add (bot must be admin).")
-            elif action == "set_cover":
-                await rate_limit_message()
-                await message.reply("Send the file name (exact) followed by the image to set as cover.")
             elif action == "stats":
                 stats = (
                     f"📊 Bot Statistics\n"
@@ -246,7 +268,6 @@ async def handle_query(client: Client, message: Message):
                     f"Users: {len(verified_users)}\n"
                     f"DB Channels: {len(db_channels)}\n"
                     f"Sub Channels: {len(force_sub_channels)}\n"
-                    f"Covers Set: {len(cover_photos)}\n"
                     f"━━━━━━━━━━━━━━"
                 )
                 await rate_limit_message()
@@ -261,7 +282,6 @@ async def handle_query(client: Client, message: Message):
             elif action == "broadcast":
                 await rate_limit_message()
                 await message.reply("Please send the message you want to broadcast to all groups.")
-            # Handle forwarded channel actions
             elif action.startswith("add_db_forward_") or action.startswith("add_sub_forward_"):
                 channel_type, _, channel_id = action.split("_")[1:4]
                 channel_id = int(channel_id)
@@ -333,10 +353,9 @@ async def handle_query(client: Client, message: Message):
             async for msg in client.search_messages(
                 chat_id=channel_id,
                 query=query,
-                filter=filters.document,
                 limit=SEARCH_LIMIT
             ):
-                if msg.document:
+                if msg.media == MessageMediaType.DOCUMENT and msg.document:
                     results.append({
                         "file_name": msg.document.file_name,
                         "file_size": round(msg.document.file_size / (1024 * 1024), 2),
@@ -363,15 +382,13 @@ async def handle_query(client: Client, message: Message):
     await rate_limit_message()
     await message.reply(f"✅ Found {len(results)} file(s) matching your query.")
 
-    # Paginate results with improved formatting
+    # Paginate results with improved performance (cache results)
     pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
     for page_num, page in enumerate(pages, 1):
         buttons = []
         for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
             dyn_id = generate_dynamic_id()
             button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
-            if file['file_name'] in cover_photos:
-                button_text += " 🖼️"
             buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
         buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
         if len(pages) > 1:
@@ -402,6 +419,20 @@ async def handle_callbacks(client: Client, callback_query):
             await log_to_channel(client, f"User {user_id} verified subscription in chat {chat_id}")
         else:
             await callback_query.answer("Please join all required channels.", show_alert=True)
+
+    elif data == "view_history":
+        history = user_search_history.get(user_id, [])
+        if not history:
+            await rate_limit_message()
+            await callback_query.message.reply("You have no recent searches.")
+            return
+        history_text = "🕒 Recent Searches\n━━━━━━━━━━━━━━\n"
+        for idx, (query, timestamp) in enumerate(history, 1):
+            time_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            history_text += f"{idx}. '{query}' at {time_str}\n"
+        history_text += "━━━━━━━━━━━━━━"
+        await rate_limit_message()
+        await callback_query.message.reply(history_text)
 
     elif data.startswith("get_"):
         _, channel_id, msg_id, _ = data.split("_", 3)
@@ -439,7 +470,7 @@ async def handle_callbacks(client: Client, callback_query):
             await log_to_channel(client, f"User {user_id} requested direct download link for message {msg_id} in channel {channel_id}")
 
     # Admin actions with password prompt
-    elif data in ["add_db", "add_sub", "set_cover", "stats", "remove_channel"] and user_id in admin_list:
+    elif data in ["add_db", "add_sub", "stats", "remove_channel"] and user_id in admin_list:
         admin_pending_action[user_id] = data
         await rate_limit_message()
         await callback_query.message.reply("🔒 Please enter the admin password to proceed:")
@@ -507,7 +538,7 @@ async def add_channel(client: Client, message: Message):
     await log_to_channel(client, f"Admin {user_id} forwarded a message to add channel {chat.id}")
 
 # Handle broadcast message after password verification
-@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|add_db$|add_sub$|stats$|broadcast$|set_cover$|remove_channel$|admin_list$|set_logchannel$).+"))
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|add_db$|add_sub$|stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|clear_logs$).+"))
 async def handle_broadcast_message(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
@@ -531,30 +562,6 @@ async def handle_broadcast_message(client: Client, message: Message):
     await rate_limit_message()
     await message.reply(f"✅ Broadcast sent to {len(all_channels)} channels.")
     await log_to_channel(client, f"Admin {user_id} broadcasted message to {len(all_channels)} channels")
-
-# Admin sets cover image (strictly for admin)
-@app.on_message(filters.private & filters.photo)
-async def handle_cover_photo(client: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in admin_list:
-        await rate_limit_message()
-        await message.reply("🚫 This action is restricted to admins only.")
-        await log_to_channel(client, f"User {user_id} attempted to set a cover photo")
-        return
-
-    if user_id not in admin_pending_action or admin_pending_action[user_id] != "set_cover":
-        return
-
-    if message.caption:
-        filename = message.caption.strip()
-        cover_photos[filename] = message.photo.file_id
-        await rate_limit_message()
-        await message.reply(f"✅ Cover photo set for {filename}.")
-        await log_to_channel(client, f"Admin {user_id} set cover photo for file {filename}")
-        admin_pending_action.pop(user_id, None)
-    else:
-        await rate_limit_message()
-        await message.reply("❌ Please provide the exact file name in the caption.")
 
 # Run bot
 if __name__ == "__main__":
