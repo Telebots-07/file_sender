@@ -92,14 +92,11 @@ async def check_bot_privileges(client: Client, chat_id: int, require_admin: bool
     try:
         bot_member: ChatMember = await client.get_chat_member(chat_id, "me")
         status = bot_member.status
-        # For channels, "member" is sufficient for searching if the bot can read messages
         if not require_admin:
             return status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-        # For groups and channels where admin is required (e.g., sending messages)
         if status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             await log_to_channel(client, f"Bot lacks admin privileges in chat {chat_id}: Status is {status}")
             return False
-        # Check if the bot has necessary permissions (e.g., can post messages)
         if isinstance(bot_member, ChatMember) and hasattr(bot_member, 'privileges'):
             if bot_member.privileges and not bot_member.privileges.can_post_messages:
                 await log_to_channel(client, f"Bot lacks post message privileges in chat {chat_id}")
@@ -143,6 +140,22 @@ async def delete_messages_later(client: Client, chat_id: int, request_msg_id: in
     finally:
         message_pairs.pop(chat_id, None)
 
+# Help command handler
+@app.on_message(filters.command("help"))
+async def help_command(client: Client, message: Message):
+    help_text = (
+        "📚 **Help Guide**\n"
+        "━━━━━━━━━━━━━━\n"
+        "• Use `/start` to begin and get your unique Start ID.\n"
+        "• Search for files by typing a keyword (e.g., 'movie').\n"
+        "• If prompted, join the required channels to proceed.\n"
+        "• Admins can use commands like `/add_db`, `/stats`, etc. (see Admin Menu).\n"
+        "━━━━━━━━━━━━━━\n"
+        "Need more help? Contact an admin!"
+    )
+    await rate_limit_message()
+    await message.reply(help_text)
+
 # Start command handler
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
@@ -169,7 +182,7 @@ async def start(client: Client, message: Message):
             [InlineKeyboardButton("🕒 Recent Searches", callback_data="view_history")]
         ]
         await rate_limit_message()
-        await client.send_message(user_id, f"Welcome! Your Start ID: {start_id}\nSearch for files by typing a keyword.", reply_markup=InlineKeyboardMarkup(buttons))
+        await client.send_message(user_id, f"Welcome! Your Start ID: {start_id}\nSearch for files by typing a keyword, or use /help for guidance.", reply_markup=InlineKeyboardMarkup(buttons))
 
     # Admin menu (text-based with "three lines" style, only in private chats)
     if chat_id > 0 and user_id in admin_list:
@@ -191,7 +204,7 @@ async def start(client: Client, message: Message):
         )
     else:
         await rate_limit_message()
-        await message.reply(f"Hi! Your Start ID: {start_id}\nSend me a keyword to search for files.")
+        await message.reply(f"Hi! Your Start ID: {start_id}\nSend me a keyword to search for files, or use /help for guidance.")
 
 # Handle admin commands
 @app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
@@ -241,7 +254,7 @@ async def handle_admin_commands(client: Client, message: Message):
     await message.reply("🔒 Please enter the admin password to proceed:")
 
 # Handle text queries (works in both private and group chats)
-@app.on_message(filters.text & ~filters.command(["start", "add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
+@app.on_message(filters.text & ~filters.command(["start", "help", "add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -355,9 +368,10 @@ async def handle_query(client: Client, message: Message):
                 query=query,
                 limit=SEARCH_LIMIT
             ):
-                if msg.media == MessageMediaType.DOCUMENT and msg.document:
+                # Ensure the message has a document before accessing its attributes
+                if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
                     results.append({
-                        "file_name": msg.document.file_name,
+                        "file_name": msg.document.file_name or "Unnamed File",
                         "file_size": round(msg.document.file_size / (1024 * 1024), 2),
                         "file_id": msg.document.file_id,
                         "msg_id": msg.id,
@@ -538,7 +552,7 @@ async def add_channel(client: Client, message: Message):
     await log_to_channel(client, f"Admin {user_id} forwarded a message to add channel {chat.id}")
 
 # Handle broadcast message after password verification
-@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|add_db$|add_sub$|stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|clear_logs$).+"))
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|add_db$|add_sub$|stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|clear_logs$).+"))
 async def handle_broadcast_message(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
