@@ -142,6 +142,7 @@ async def shorten_link(long_url: str) -> str:
 # Helper: Send log message to log channel if set
 async def log_to_channel(client: Client, message: str):
     if log_channel is None:
+        logger.warning("Log channel not set, cannot log message")
         return
     try:
         await queue_message(client.send_message, log_channel, f"📋 Log: {message}")
@@ -219,12 +220,12 @@ async def feedback_command(client: Client, message: Message):
     chat_id = message.chat.id
 
     if len(message.command) < 2:
-        await queue_message(message.reply, "Please provide your feedback. Usage: /feedback <your feedback>")
+        await queue_message(message.reply, "❌ Failed to send feedback: Please provide your feedback. Usage: /feedback <your feedback>. 💬")
         return
 
     feedback = " ".join(message.command[1:])
-    await log_to_channel(client, f"Feedback from user {user_id} in chat {chat_id}: {feedback}")
-    await queue_message(message.reply, "Thank you for your feedback! It has been sent to the admins. 🌟")
+    await log_to_channel(client, f"Feedback received from user {user_id} in chat {chat_id}: {feedback}")
+    await queue_message(message.reply, "✅ Feedback sent successfully! Thank you for your input! 🌟")
 
 # Help command handler
 @app.on_message(filters.command("help"))
@@ -242,23 +243,57 @@ async def help_command(client: Client, message: Message):
     )
     await queue_message(message.reply, help_text)
 
+# Channels command handler (for admins)
+@app.on_message(filters.private & filters.command("channels"))
+async def channels_command(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in admin_list:
+        await queue_message(message.reply, "❌ Failed to list channels: This action is restricted to admins only. 🚫")
+        await log_to_channel(client, f"User {user_id} attempted restricted admin command: channels")
+        return
+
+    channels_text = "📋 **Channel List** 🌟\n━━━━━━━━━━━━━━\n"
+    channels_text += "🔹 **Database Channels** 📚\n"
+    if db_channels:
+        for ch in db_channels:
+            channels_text += f"• {ch}\n"
+    else:
+        channels_text += "No DB channels added.\n"
+
+    channels_text += "\n🔹 **Subscription Channels** 📢\n"
+    if force_sub_channels:
+        for ch in force_sub_channels:
+            channels_text += f"• {ch}\n"
+    else:
+        channels_text += "No subscription channels added.\n"
+
+    channels_text += "\n🔹 **Log Channel** 📝\n"
+    if log_channel:
+        channels_text += f"• {log_channel}\n"
+    else:
+        channels_text += "No log channel set.\n"
+
+    channels_text += "━━━━━━━━━━━━━━"
+    await queue_message(message.reply, channels_text)
+    await log_to_channel(client, f"Admin {user_id} listed channels")
+
 # Caption command handler (for admins)
 @app.on_message(filters.private & filters.command("caption"))
 async def caption_command(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
-        await queue_message(message.reply, "🚫 This action is restricted to admins only.")
+        await queue_message(message.reply, "❌ Failed to set caption: This action is restricted to admins only. 🚫")
         await log_to_channel(client, f"User {user_id} attempted restricted admin command: caption")
         return
 
     if len(message.command) < 2:
-        await queue_message(message.reply, "Please provide the new caption format. Usage: /caption <format>\nExample: /caption file \\n📜 {filename} ({size}MB) \\nuploaded by @bot_paiyan")
+        await queue_message(message.reply, "❌ Failed to set caption: Please provide the new caption format. Usage: /caption <format>\nExample: /caption file \\n📜 {filename} ({size}MB) \\nuploaded by @bot_paiyan. 📜")
         return
 
     global custom_caption_format
     custom_caption_format = " ".join(message.command[1:])
-    await queue_message(message.reply, f"✅ Caption format updated to:\n{custom_caption_format}")
-    await log_to_channel(client, f"Admin {user_id} updated caption format to: {custom_caption_format}")
+    await queue_message(message.reply, f"✅ Caption format updated successfully! 📜\nNew format: {custom_caption_format}")
+    await log_to_channel(client, f"Admin {user_id} successfully updated caption format to: {custom_caption_format}")
 
 # Start command handler
 @app.on_message(filters.command("start"))
@@ -297,6 +332,7 @@ async def start(client: Client, message: Message):
             "/genbatch - Generate a new batch of files 🎁\n"
             "/editbatch - Edit an existing batch of files ✏️\n"
             "/caption - Set custom caption format for files 📜\n"
+            "/channels - List all configured channels 📋\n"
             "/stats - View bot statistics 📊\n"
             "/user_stats - View user activity statistics 📈\n"
             "/broadcast - Broadcast a message 📣\n"
@@ -313,11 +349,11 @@ async def start(client: Client, message: Message):
         await queue_message(message.reply, "Hi! 👋\nSend me a keyword to search for files, or use /help for guidance. 🔍")
 
 # Handle admin commands
-@app.on_message(filters.private & filters.command(["add_db", "add_sub", "genbatch", "editbatch", "caption", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
+@app.on_message(filters.private & filters.command(["add_db", "add_sub", "genbatch", "editbatch", "caption", "channels", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_admin_commands(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
-        await queue_message(message.reply, "🚫 This action is restricted to admins only.")
+        await queue_message(message.reply, "❌ Failed to execute command: This action is restricted to admins only. 🚫")
         await log_to_channel(client, f"User {user_id} attempted restricted admin command: {message.command[0]}")
         return
 
@@ -327,6 +363,7 @@ async def handle_admin_commands(client: Client, message: Message):
     if command == "admin_list":
         admin_text = "👥 Admin List\n━━━━━━━━━━━━━━\n" + "\n".join(f"Admin ID: {admin_id}" for admin_id in admin_list) + "\n━━━━━━━━━━━━━━"
         await queue_message(message.reply, admin_text)
+        await log_to_channel(client, f"Admin {user_id} successfully listed admin list")
         return
 
     if command == "set_logchannel":
@@ -346,7 +383,8 @@ async def handle_admin_commands(client: Client, message: Message):
 
     if command == "editbatch":
         if not batches:
-            await queue_message(message.reply, "❌ No batches exist. Create a batch using /genbatch first. 🎁")
+            await queue_message(message.reply, "❌ Failed to edit batch: No batches exist. Create a batch using /genbatch first. 🎁")
+            await log_to_channel(client, f"Admin {user_id} failed to edit batch: No batches exist")
             return
         admin_pending_action[user_id] = "editbatch_keyword"
         await queue_message(message.reply, "✏️ Let's edit a batch! 📝\nPlease provide the keyword of the batch you want to edit (e.g., 'leo'):")
@@ -358,27 +396,43 @@ async def handle_admin_commands(client: Client, message: Message):
             stats_text += f"User ID: {uid}, Searches: {count}\n"
         stats_text += "━━━━━━━━━━━━━━"
         await queue_message(message.reply, stats_text)
+        await log_to_channel(client, f"Admin {user_id} successfully viewed user activity statistics")
+        return
+
+    if command == "stats":
+        stats = (
+            f"📊 Bot Statistics\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"Users: {len(verified_users)}\n"
+            f"DB Channels: {len(db_channels)}\n"
+            f"Sub Channels: {len(force_sub_channels)}\n"
+            f"Batches: {len(batches)}\n"
+            f"━━━━━━━━━━━━━━"
+        )
+        await queue_message(message.reply, stats)
+        await log_to_channel(client, f"Admin {user_id} successfully viewed bot statistics")
         return
 
     if command == "clear_logs":
         if log_channel is None:
-            await queue_message(message.reply, "❌ No log channel set. Use /set_logchannel to set one. 📝")
+            await queue_message(message.reply, "❌ Failed to clear logs: No log channel set. Use /set_logchannel to set one. 📝")
+            await log_to_channel(client, f"Admin {user_id} failed to clear logs: No log channel set")
             return
         try:
             async for msg in client.get_chat_history(log_channel, limit=100):
                 await client.delete_messages(log_channel, msg.id)
-            await queue_message(message.reply, "✅ Logs cleared in the log channel. 🧹")
-            await log_to_channel(client, f"Admin {user_id} cleared logs in log channel {log_channel}")
+            await queue_message(message.reply, "✅ Logs cleared successfully in the log channel! 🧹")
+            await log_to_channel(client, f"Admin {user_id} successfully cleared logs in log channel {log_channel}")
         except Exception as e:
-            await queue_message(message.reply, "❌ Error clearing logs.")
-            await log_to_channel(client, f"Error clearing logs in log channel {log_channel}: {str(e)}")
+            await queue_message(message.reply, f"❌ Failed to clear logs: An error occurred - {str(e)}. 😓")
+            await log_to_channel(client, f"Admin {user_id} failed to clear logs in log channel {log_channel}: {str(e)}")
         return
 
     admin_pending_action[user_id] = command
     await queue_message(message.reply, "🔒 Please enter the admin password to proceed:")
 
 # Handle text queries (works in both private and group chats)
-@app.on_message(filters.text & ~filters.command(["start", "help", "feedback", "add_db", "add_sub", "genbatch", "editbatch", "caption", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
+@app.on_message(filters.text & ~filters.command(["start", "help", "feedback", "add_db", "add_sub", "genbatch", "editbatch", "caption", "channels", "stats", "user_stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "set_rate_limit", "clear_logs"]))
 async def handle_query(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -413,7 +467,12 @@ async def handle_query(client: Client, message: Message):
                     f"━━━━━━━━━━━━━━"
                 )
                 await queue_message(message.reply, stats)
+                await log_to_channel(client, f"Admin {user_id} successfully viewed bot statistics")
             elif action == "remove_channel":
+                if not db_channels and not force_sub_channels:
+                    await queue_message(message.reply, "❌ Failed to remove channel: No channels available to remove. 📚📢")
+                    await log_to_channel(client, f"Admin {user_id} failed to remove channel: No channels available")
+                    return
                 buttons = [
                     [InlineKeyboardButton(f"DB: {ch}", callback_data=f"rm_db_{ch}") for ch in db_channels],
                     [InlineKeyboardButton(f"Sub: {ch}", callback_data=f"rm_sub_{ch}") for ch in force_sub_channels]
@@ -425,43 +484,55 @@ async def handle_query(client: Client, message: Message):
                 try:
                     max_msgs, min_delay = map(float, query.split())
                     if max_msgs < 1 or min_delay < 0.5:
-                        await queue_message(message.reply, "❌ Invalid values. max_messages must be >= 1, min_delay must be >= 0.5")
+                        await queue_message(message.reply, "❌ Failed to set rate limit: max_messages must be >= 1, min_delay must be >= 0.5. ⚙️")
+                        await log_to_channel(client, f"Admin {user_id} failed to set rate limit: Invalid values (max_msgs={max_msgs}, min_delay={min_delay})")
                         return
                     global RATE_LIMIT_MAX_MESSAGES, MIN_MESSAGE_DELAY
                     RATE_LIMIT_MAX_MESSAGES = int(max_msgs)
                     MIN_MESSAGE_DELAY = min_delay
                     message_timestamps.maxlen = RATE_LIMIT_MAX_MESSAGES
-                    await queue_message(message.reply, f"✅ Rate limits updated: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY} ⚙️")
-                    await log_to_channel(client, f"Admin {user_id} updated rate limits: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY}")
+                    await queue_message(message.reply, f"✅ Rate limits updated successfully: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY}! ⚙️")
+                    await log_to_channel(client, f"Admin {user_id} successfully updated rate limits: max_messages={RATE_LIMIT_MAX_MESSAGES}, min_delay={MIN_MESSAGE_DELAY}")
                 except ValueError:
-                    await queue_message(message.reply, "❌ Invalid format. Please use: max_messages min_delay (e.g., 15 1.5)")
+                    await queue_message(message.reply, "❌ Failed to set rate limit: Invalid format. Please use: max_messages min_delay (e.g., 15 1.5). ⚙️")
+                    await log_to_channel(client, f"Admin {user_id} failed to set rate limit: Invalid format")
             elif action.startswith("add_db_forward_") or action.startswith("add_sub_forward_"):
                 channel_type, _, channel_id = action.split("_")[1:4]
                 channel_id = int(channel_id)
                 if not await check_bot_privileges(client, channel_id):
-                    await queue_message(message.reply, "❌ Bot must be an admin in the channel with sufficient privileges.")
+                    await queue_message(message.reply, f"❌ Failed to add {channel_type} channel: Bot must be an admin in the channel {channel_id} with sufficient privileges. ⚙️")
+                    await log_to_channel(client, f"Admin {user_id} failed to add {channel_type} channel {channel_id}: Bot lacks admin privileges")
                     return
 
                 if channel_type == "db":
                     db_channels.add(channel_id)
-                    await queue_message(message.reply, f"✅ DB channel {channel_id} added. 📚")
-                    await log_to_channel(client, f"Admin {user_id} added DB channel {channel_id}")
+                    await queue_message(message.reply, f"✅ DB channel {channel_id} added successfully! 📚")
+                    await log_to_channel(client, f"Admin {user_id} successfully added DB channel {channel_id}")
                 else:  # sub
                     force_sub_channels.add(channel_id)
-                    await queue_message(message.reply, f"✅ Subscription channel {channel_id} added. 📢")
-                    await log_to_channel(client, f"Admin {user_id} added subscription channel {channel_id}")
+                    await queue_message(message.reply, f"✅ Subscription channel {channel_id} added successfully! 📢")
+                    await log_to_channel(client, f"Admin {user_id} successfully added subscription channel {channel_id}")
             elif action.startswith("rm_db_"):
                 channel_id = int(action.split("_")[2])
+                if channel_id not in db_channels:
+                    await queue_message(message.reply, f"❌ Failed to remove DB channel: Channel {channel_id} not found in DB channels. 📚")
+                    await log_to_channel(client, f"Admin {user_id} failed to remove DB channel {channel_id}: Channel not found")
+                    return
                 db_channels.discard(channel_id)
-                await queue_message(message.reply, f"✅ DB channel {channel_id} removed. 🗑️")
-                await log_to_channel(client, f"Admin {user_id} removed DB channel {channel_id}")
+                await queue_message(message.reply, f"✅ DB channel {channel_id} removed successfully! 🗑️")
+                await log_to_channel(client, f"Admin {user_id} successfully removed DB channel {channel_id}")
             elif action.startswith("rm_sub_"):
                 channel_id = int(action.split("_")[2])
+                if channel_id not in force_sub_channels:
+                    await queue_message(message.reply, f"❌ Failed to remove subscription channel: Channel {channel_id} not found in subscription channels. 📢")
+                    await log_to_channel(client, f"Admin {user_id} failed to remove subscription channel {channel_id}: Channel not found")
+                    return
                 force_sub_channels.discard(channel_id)
-                await queue_message(message.reply, f"✅ Subscription channel {channel_id} removed. 🗑️")
-                await log_to_channel(client, f"Admin {user_id} removed subscription channel {channel_id}")
+                await queue_message(message.reply, f"✅ Subscription channel {channel_id} removed successfully! 🗑️")
+                await log_to_channel(client, f"Admin {user_id} successfully removed subscription channel {channel_id}")
         else:
-            await queue_message(message.reply, "❌ Incorrect password. Try again. 🔒")
+            await queue_message(message.reply, "❌ Failed to authenticate: Incorrect password. Try again. 🔒")
+            await log_to_channel(client, f"Admin {user_id} failed to authenticate: Incorrect password")
             admin_pending_action.pop(user_id, None)
         return
 
@@ -469,7 +540,8 @@ async def handle_query(client: Client, message: Message):
     if chat_id > 0 and user_id in admin_list and user_id in admin_pending_action:
         if admin_pending_action[user_id] == "genbatch_keyword":
             if not query:
-                await queue_message(message.reply, "❌ Please provide a valid keyword. 🖋️")
+                await queue_message(message.reply, "❌ Failed to create batch: Please provide a valid keyword. 🖋️")
+                await log_to_channel(client, f"Admin {user_id} failed to create batch: Invalid keyword")
                 return
             admin_batch_keywords[user_id] = query.lower()
             admin_pending_action[user_id] = "genbatch_files"
@@ -493,11 +565,13 @@ async def handle_query(client: Client, message: Message):
             return
         elif admin_pending_action[user_id] == "editbatch_keyword":
             if not query:
-                await queue_message(message.reply, "❌ Please provide a valid keyword. 🖋️")
+                await queue_message(message.reply, "❌ Failed to edit batch: Please provide a valid keyword. 🖋️")
+                await log_to_channel(client, f"Admin {user_id} failed to edit batch: Invalid keyword")
                 return
             keyword = query.lower()
             if keyword not in batches:
-                await queue_message(message.reply, f"❌ No batch found with keyword '{keyword}'. Create a batch using /genbatch first. 🎁")
+                await queue_message(message.reply, f"❌ Failed to edit batch: No batch found with keyword '{keyword}'. Create a batch using /genbatch first. 🎁")
+                await log_to_channel(client, f"Admin {user_id} failed to edit batch: No batch found with keyword '{keyword}'")
                 admin_pending_action.pop(user_id, None)
                 return
             admin_batch_keywords[user_id] = keyword
@@ -516,12 +590,14 @@ async def handle_query(client: Client, message: Message):
             )
             return
         elif admin_pending_action[user_id] in ("genbatch_files", "editbatch_files") and query.lower() == "done":
+            keyword = admin_batch_keywords[user_id]
+            num_files = len(batches[keyword]["msg_ids"]) if keyword in batches else 0
             if admin_pending_action[user_id] == "genbatch_files":
-                await queue_message(message.reply, "✅ Batch creation completed! 🎉")
-                await log_to_channel(client, f"Admin {user_id} completed batch creation for keyword '{admin_batch_keywords[user_id]}'")
+                await queue_message(message.reply, f"✅ Batch '{keyword}' created successfully with {num_files} files! 🎉")
+                await log_to_channel(client, f"Admin {user_id} successfully completed batch creation for keyword '{keyword}' with {num_files} files")
             else:
-                await queue_message(message.reply, "✅ Batch edit completed! 🎉")
-                await log_to_channel(client, f"Admin {user_id} completed batch edit for keyword '{admin_batch_keywords[user_id]}'")
+                await queue_message(message.reply, f"✅ Batch '{keyword}' updated successfully with {num_files} files! ✏️")
+                await log_to_channel(client, f"Admin {user_id} successfully completed batch edit for keyword '{keyword}' with {num_files} files")
             admin_pending_action.pop(user_id, None)
             admin_batch_keywords.pop(user_id, None)
             return
@@ -535,13 +611,15 @@ async def handle_query(client: Client, message: Message):
 
     # Input validation
     if len(query) < 3:
-        await queue_message(message.reply, "Please enter a search term with at least 3 characters. 🔍")
+        await queue_message(message.reply, "❌ Failed to search: Please enter a search term with at least 3 characters. 🔍")
+        await log_to_channel(client, f"User {user_id} failed to search: Query '{query}' is too short")
         return
 
     # Check if bot has sufficient privileges in the group
     if chat_id < 0:
         if not await check_bot_privileges(client, chat_id):
-            await queue_message(message.reply, "❌ I need to be an admin in this group with sufficient privileges to perform searches. ⚙️")
+            await queue_message(message.reply, "❌ Failed to search: I need to be an admin in this group with sufficient privileges to perform searches. ⚙️")
+            await log_to_channel(client, f"User {user_id} failed to search in chat {chat_id}: Bot lacks admin privileges")
             return
 
     searching_msg = await message.reply("🔍 Searching for your query... 🌟")
@@ -570,11 +648,13 @@ async def handle_query(client: Client, message: Message):
                         })
             except Exception as e:
                 await log_to_channel(client, f"Error fetching batch files for keyword '{keyword}': {str(e)}")
-                continue
+                await queue_message(searching_msg.edit, f"❌ Failed to fetch batch files: An error occurred - {str(e)}. 😓")
+                message_pairs.pop(chat_id, None)
+                return
             break
 
     if batch_results:
-        await log_to_channel(client, f"User {user_id} found batch match for query '{query}' with keyword '{matched_keyword}'")
+        await log_to_channel(client, f"User {user_id} successfully found batch match for query '{query}' with keyword '{matched_keyword}'")
         # Format the results as specified
         result_text = f"available:\n"
         buttons = []
@@ -606,7 +686,7 @@ async def handle_query(client: Client, message: Message):
     now = time.time()
     if chat_id in search_cache and chat_id in search_cache_expiry and now < search_cache_expiry[chat_id]:
         results = search_cache[chat_id]
-        await log_to_channel(client, f"User {user_id} used cached results for query: '{query}'")
+        await log_to_channel(client, f"User {user_id} successfully used cached results for query: '{query}'")
     else:
         # Search channels concurrently
         results = []
@@ -647,17 +727,17 @@ async def handle_query(client: Client, message: Message):
             await asyncio.gather(*tasks)
 
             if not results:
-                await queue_message(searching_msg.edit, "No files found in the database channels. 😔")
-                await log_to_channel(client, f"No matches found for query '{query}' in chat {chat_id}")
+                await queue_message(searching_msg.edit, "❌ No files found in the database channels. 😔")
+                await log_to_channel(client, f"User {user_id} failed to find matches for query '{query}' in chat {chat_id}")
                 return
 
             # Cache the results
             search_cache[chat_id] = results
             search_cache_expiry[chat_id] = now + CACHE_DURATION
+            await log_to_channel(client, f"User {user_id} successfully searched and cached results for query: '{query}'")
         except Exception as e:
-            await queue_message(searching_msg.edit, "❌ An error occurred while searching. Please try again. 😓")
-            await log_to_channel(client, f"Search error for user {user_id} in chat {chat_id}: {str(e)}")
-            logger.error(f"Search error: {e}")
+            await queue_message(searching_msg.edit, f"❌ Failed to search: An error occurred - {str(e)}. 😓")
+            await log_to_channel(client, f"User {user_id} failed to search in chat {chat_id}: {str(e)}")
             message_pairs.pop(chat_id, None)
             return
 
@@ -698,7 +778,8 @@ async def handle_media(client: Client, message: Message):
 
     # Check if a database channel exists
     if not db_channels:
-        await queue_message(message.reply, "❌ No database channel found. Please add one using /add_db first. 📚")
+        await queue_message(message.reply, "❌ Failed to add file: No database channel found. Please add one using /add_db first. 📚")
+        await log_to_channel(client, f"Admin {user_id} failed to add file to batch: No database channel found")
         admin_pending_action.pop(user_id, None)
         admin_batch_keywords.pop(user_id, None)
         return
@@ -716,13 +797,14 @@ async def handle_media(client: Client, message: Message):
                 old_msg_ids = old_batch["msg_ids"]
                 try:
                     await client.delete_messages(old_channel_id, old_msg_ids)
-                    await log_to_channel(client, f"Admin {user_id} deleted old files for batch '{keyword}' in channel {old_channel_id}")
+                    await log_to_channel(client, f"Admin {user_id} successfully deleted old files for batch '{keyword}' in channel {old_channel_id}")
                 except Exception as e:
-                    await log_to_channel(client, f"Error deleting old files for batch '{keyword}': {str(e)}")
+                    await log_to_channel(client, f"Admin {user_id} failed to delete old files for batch '{keyword}': {str(e)}")
                 # Clear the old message IDs
                 batches[keyword]["msg_ids"] = []
             else:
-                await queue_message(message.reply, "❌ Batch not found. Please start over with /editbatch. 😔")
+                await queue_message(message.reply, "❌ Failed to edit batch: Batch not found. Please start over with /editbatch. 😔")
+                await log_to_channel(client, f"Admin {user_id} failed to edit batch: Batch '{keyword}' not found")
                 admin_pending_action.pop(user_id, None)
                 admin_batch_keywords.pop(user_id, None)
                 return
@@ -745,16 +827,17 @@ async def handle_media(client: Client, message: Message):
         elif message.audio:
             sent_msg = await client.send_audio(channel_id, message.audio.file_id, caption=caption)
         else:
-            await queue_message(message.reply, "❌ Unsupported file type. 😔")
+            await queue_message(message.reply, "❌ Failed to add file: Unsupported file type. 😔")
+            await log_to_channel(client, f"Admin {user_id} failed to add file to batch '{keyword}': Unsupported file type")
             return
 
         # Store the message ID in the batch
         batches[keyword]["msg_ids"].append(sent_msg.id)
-        await log_to_channel(client, f"Admin {user_id} added file to batch '{keyword}' in channel {channel_id}, msg_id: {sent_msg.id}")
+        await log_to_channel(client, f"Admin {user_id} successfully added file to batch '{keyword}' in channel {channel_id}, msg_id: {sent_msg.id}")
 
         await queue_message(
             message.reply,
-            f"✅ File '{file_name}' added to batch '{keyword}'! 🎉\nSend more files or use the buttons below to continue. 🚀",
+            f"✅ File '{file_name}' added to batch '{keyword}' successfully! 🎉\nSend more files or use the buttons below to continue. 🚀",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📤 Add More Files", callback_data="genbatch_add_files" if admin_pending_action[user_id] == "genbatch_files" else "editbatch_add_files")],
                 [InlineKeyboardButton("🎉 Sticker Panel", callback_data="genbatch_sticker_panel" if admin_pending_action[user_id] == "genbatch_files" else "editbatch_sticker_panel")],
@@ -764,8 +847,8 @@ async def handle_media(client: Client, message: Message):
         )
 
     except Exception as e:
-        await queue_message(message.reply, "❌ Error uploading file to the database channel. 😓")
-        await log_to_channel(client, f"Error uploading file for batch '{keyword}' by admin {user_id}: {str(e)}")
+        await queue_message(message.reply, f"❌ Failed to upload file to DB channel: {str(e)}. 😓")
+        await log_to_channel(client, f"Admin {user_id} failed to upload file for batch '{keyword}' to channel {channel_id}: {str(e)}")
         admin_pending_action.pop(user_id, None)
         admin_batch_keywords.pop(user_id, None)
 
@@ -780,15 +863,17 @@ async def handle_callbacks(client: Client, callback_query):
         if data == "check_sub":
             if await check_subscription(client, user_id, chat_id):
                 verified_users[user_id] = time.time()
-                await queue_message(callback_query.message.edit, "✅ Subscription verified! You can now search for files. 🎉")
-                await log_to_channel(client, f"User {user_id} verified subscription in chat {chat_id}")
+                await queue_message(callback_query.message.edit, "✅ Subscription verified successfully! You can now search for files. 🎉")
+                await log_to_channel(client, f"User {user_id} successfully verified subscription in chat {chat_id}")
             else:
-                await callback_query.answer("Please join all required channels. 📢", show_alert=True)
+                await callback_query.answer("❌ Failed to verify subscription: Please join all required channels. 📢", show_alert=True)
+                await log_to_channel(client, f"User {user_id} failed to verify subscription in chat {chat_id}")
 
         elif data == "view_history":
             history = user_search_history.get(user_id, [])
             if not history:
-                await queue_message(callback_query.message.reply, "You have no recent searches. 🕒")
+                await queue_message(callback_query.message.reply, "❌ Failed to view history: You have no recent searches. 🕒")
+                await log_to_channel(client, f"User {user_id} failed to view search history: No recent searches")
                 return
             history_text = "🕒 Recent Searches\n━━━━━━━━━━━━━━\n"
             for idx, (query, timestamp) in enumerate(history, 1):
@@ -796,6 +881,7 @@ async def handle_callbacks(client: Client, callback_query):
                 history_text += f"{idx}. '{query}' at {time_str}\n"
             history_text += "━━━━━━━━━━━━━━"
             await queue_message(callback_query.message.reply, history_text)
+            await log_to_channel(client, f"User {user_id} successfully viewed search history")
 
         elif data in ("genbatch_add_files", "editbatch_add_files"):
             await callback_query.answer("Please send the files you want to add to the batch! 📁", show_alert=True)
@@ -812,29 +898,38 @@ async def handle_callbacks(client: Client, callback_query):
                     [InlineKeyboardButton("❌ Close Panel", callback_data="sticker_close")]
                 ])
             )
+            await log_to_channel(client, f"Admin {user_id} opened sticker panel for batch")
 
         elif data.startswith("sticker_"):
             sticker_type = data.split("_")[1]
             if sticker_type == "party":
                 await queue_message(callback_query.message.reply, "🎉 Let's celebrate with a party sticker! 🎈")
+                await log_to_channel(client, f"Admin {user_id} selected party sticker")
             elif sticker_type == "rocket":
                 await queue_message(callback_query.message.reply, "🚀 Blast off with a rocket sticker! 🌌")
+                await log_to_channel(client, f"Admin {user_id} selected rocket sticker")
             elif sticker_type == "star":
                 await queue_message(callback_query.message.reply, "🌟 Shine bright with a star sticker! ✨")
+                await log_to_channel(client, f"Admin {user_id} selected star sticker")
             elif sticker_type == "gift":
                 await queue_message(callback_query.message.reply, "🎁 Unwrap a gift sticker! 🎀")
+                await log_to_channel(client, f"Admin {user_id} selected gift sticker")
             elif sticker_type == "close":
                 await queue_message(callback_query.message.reply, "Sticker panel closed. Let's continue with the batch! 🚀")
+                await log_to_channel(client, f"Admin {user_id} closed sticker panel")
             else:
-                await callback_query.answer("Invalid sticker selection. 😔", show_alert=True)
+                await callback_query.answer("❌ Failed to select sticker: Invalid sticker selection. 😔", show_alert=True)
+                await log_to_channel(client, f"Admin {user_id} failed to select sticker: Invalid selection '{sticker_type}'")
 
         elif data in ("genbatch_done", "editbatch_done") and user_id in admin_list and admin_pending_action.get(user_id) in ("genbatch_files", "editbatch_files"):
+            keyword = admin_batch_keywords[user_id]
+            num_files = len(batches[keyword]["msg_ids"]) if keyword in batches else 0
             if admin_pending_action[user_id] == "genbatch_files":
-                await queue_message(callback_query.message.reply, "✅ Batch creation completed! 🎉")
-                await log_to_channel(client, f"Admin {user_id} completed batch creation for keyword '{admin_batch_keywords[user_id]}'")
+                await queue_message(callback_query.message.reply, f"✅ Batch '{keyword}' created successfully with {num_files} files! 🎉")
+                await log_to_channel(client, f"Admin {user_id} successfully completed batch creation for keyword '{keyword}' with {num_files} files")
             else:
-                await queue_message(callback_query.message.reply, "✅ Batch edit completed! 🎉")
-                await log_to_channel(client, f"Admin {user_id} completed batch edit for keyword '{admin_batch_keywords[user_id]}'")
+                await queue_message(callback_query.message.reply, f"✅ Batch '{keyword}' updated successfully with {num_files} files! ✏️")
+                await log_to_channel(client, f"Admin {user_id} successfully completed batch edit for keyword '{keyword}' with {num_files} files")
             admin_pending_action.pop(user_id, None)
             admin_batch_keywords.pop(user_id, None)
 
@@ -846,13 +941,13 @@ async def handle_callbacks(client: Client, callback_query):
                 try:
                     if channel_id and msg_ids:
                         await client.delete_messages(channel_id, msg_ids)
-                        await log_to_channel(client, f"Admin {user_id} cancelled batch '{keyword}' and deleted files in channel {channel_id}")
+                        await log_to_channel(client, f"Admin {user_id} successfully cancelled batch '{keyword}' and deleted files in channel {channel_id}")
                 except Exception as e:
-                    await log_to_channel(client, f"Error deleting files during batch cancellation for '{keyword}': {str(e)}")
+                    await log_to_channel(client, f"Admin {user_id} failed to delete files during batch cancellation for '{keyword}': {str(e)}")
                 batches.pop(keyword, None)
                 batch_start_ids.pop(keyword, None)
-            await queue_message(callback_query.message.reply, "❌ Batch creation/editing cancelled. 🗑️")
-            await log_to_channel(client, f"Admin {user_id} cancelled batch for keyword '{keyword}'")
+            await queue_message(callback_query.message.reply, "✅ Batch creation/editing cancelled successfully! 🗑️")
+            await log_to_channel(client, f"Admin {user_id} successfully cancelled batch for keyword '{keyword}'")
             admin_pending_action.pop(user_id, None)
             admin_batch_keywords.pop(user_id, None)
 
@@ -867,7 +962,7 @@ async def handle_callbacks(client: Client, callback_query):
                 callback_query.message.reply,
                 f"🔗 Share this file with others:\n{shortened_link}"
             )
-            await log_to_channel(client, f"User {user_id} shared file link for message {msg_id} in channel {channel_id}")
+            await log_to_channel(client, f"User {user_id} successfully shared file link for message {msg_id} in channel {channel_id}")
 
         elif data.startswith("get_"):
             _, channel_id, msg_id, _ = data.split("_", 3)
@@ -877,12 +972,13 @@ async def handle_callbacks(client: Client, callback_query):
             # Log subscription check
             if chat_id > 0 and force_sub_channels:
                 sub_status = await check_subscription(client, user_id, chat_id)
-                await log_to_channel(client, f"Subscription check for user {user_id} in chat {chat_id}: {sub_status}")
                 if not sub_status:
                     buttons = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/c/{str(ch)[4:]}")] for ch in force_sub_channels]
                     buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
-                    await queue_message(callback_query.message.reply, "Please join the required channels: 📢", reply_markup=InlineKeyboardMarkup(buttons))
+                    await queue_message(callback_query.message.reply, "❌ Failed to get file: Please join the required channels. 📢", reply_markup=InlineKeyboardMarkup(buttons))
+                    await log_to_channel(client, f"User {user_id} failed to get file in chat {chat_id}: Subscription check failed")
                     return
+                await log_to_channel(client, f"User {user_id} passed subscription check in chat {chat_id}")
 
             # Log verification status
             verified_time = verified_users.get(user_id, 0)
@@ -906,7 +1002,7 @@ async def handle_callbacks(client: Client, callback_query):
                         [InlineKeyboardButton("🔗 Share File", callback_data=f"share_{channel_id}_{msg_id}_{generate_dynamic_id()}")]
                     ])
                 )
-                await log_to_channel(client, f"User {user_id} requested shortened download link for message {msg_id} in channel {channel_id}")
+                await log_to_channel(client, f"User {user_id} successfully requested shortened download link for message {msg_id} in channel {channel_id}")
             else:
                 await queue_message(
                     callback_query.message.reply,
@@ -917,20 +1013,22 @@ async def handle_callbacks(client: Client, callback_query):
                         [InlineKeyboardButton("🔗 Share File", callback_data=f"share_{channel_id}_{msg_id}_{generate_dynamic_id()}")]
                     ])
                 )
-                await log_to_channel(client, f"User {user_id} requested direct download link for message {msg_id} in channel {channel_id}")
+                await log_to_channel(client, f"User {user_id} successfully requested direct download link for message {msg_id} in channel {channel_id}")
 
         elif data.startswith("page_"):
             page_num = int(data.split("_")[1])
             # Use cached results if available
             now = time.time()
             if chat_id not in search_cache or chat_id not in search_cache_expiry or now >= search_cache_expiry[chat_id]:
-                await callback_query.answer("Search results have expired. Please search again. 🔍", show_alert=True)
+                await callback_query.answer("❌ Failed to view page: Search results have expired. Please search again. 🔍", show_alert=True)
+                await log_to_channel(client, f"User {user_id} failed to view page {page_num}: Search results expired")
                 return
 
             results = search_cache[chat_id]
             pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
             if page_num < 1 or page_num > len(pages):
-                await callback_query.answer("Invalid page number. 😔", show_alert=True)
+                await callback_query.answer("❌ Failed to view page: Invalid page number. 😔", show_alert=True)
+                await log_to_channel(client, f"User {user_id} failed to view page {page_num}: Invalid page number")
                 return
 
             page = pages[page_num - 1]
@@ -952,6 +1050,7 @@ async def handle_callbacks(client: Client, callback_query):
                 f"📂 Search Results (Page {page_num}/{len(pages)}):",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
+            await log_to_channel(client, f"User {user_id} successfully viewed search results page {page_num}")
 
         # Admin actions with password prompt
         elif data in ["add_db", "add_sub", "stats", "remove_channel"] and user_id in admin_list:
@@ -982,32 +1081,34 @@ async def handle_callbacks(client: Client, callback_query):
     except Exception as e:
         await log_to_channel(client, f"Error in callback for user {user_id}: {str(e)}")
         logger.error(f"Error in callback: {e}")
-        await callback_query.answer("An error occurred. Please try again. 😓", show_alert=True)
+        await callback_query.answer(f"❌ Failed to process callback: An error occurred - {str(e)}. 😓", show_alert=True)
 
 # Handle forwarded message from admin (strictly for admin)
 @app.on_message(filters.private & filters.forwarded)
 async def add_channel(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list:
-        await queue_message(message.reply, "🚫 This action is restricted to admins only.")
+        await queue_message(message.reply, "❌ Failed to add channel: This action is restricted to admins only. 🚫")
         await log_to_channel(client, f"User {user_id} attempted to forward a message for admin action")
         return
 
     chat = message.forward_from_chat
     if not chat:
-        await queue_message(message.reply, "❌ Invalid forwarded message. 😔")
+        await queue_message(message.reply, "❌ Failed to add channel: Invalid forwarded message. 😔")
+        await log_to_channel(client, f"Admin {user_id} failed to add channel: Invalid forwarded message")
         return
 
     if not await check_bot_privileges(client, chat.id):
-        await queue_message(message.reply, "❌ Bot must be an admin in the channel with sufficient privileges. ⚙️")
+        await queue_message(message.reply, f"❌ Failed to add channel: Bot must be an admin in the channel {chat.id} with sufficient privileges. ⚙️")
+        await log_to_channel(client, f"Admin {user_id} failed to add channel {chat.id}: Bot lacks admin privileges")
         return
 
     if user_id in admin_pending_action and admin_pending_action[user_id] == "set_logchannel":
         global log_channel
         log_channel = chat.id
         admin_pending_action.pop(user_id, None)
-        await queue_message(message.reply, f"✅ Log channel set to {chat.id}. 📝")
-        await log_to_channel(client, f"Admin {user_id} set log channel to {chat.id}")
+        await queue_message(message.reply, f"✅ Log channel {chat.id} set successfully! 📝")
+        await log_to_channel(client, f"Admin {user_id} successfully set log channel to {chat.id}")
         return
 
     await queue_message(
@@ -1021,7 +1122,7 @@ async def add_channel(client: Client, message: Message):
     await log_to_channel(client, f"Admin {user_id} forwarded a message to add channel {chat.id}")
 
 # Handle broadcast message after password verification
-@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|/feedback$|add_db$|add_sub$|genbatch$|editbatch$|caption$|stats$|user_stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|set_rate_limit$|clear_logs$).+"))
+@app.on_message(filters.private & filters.text & filters.regex(r"^(?!/start$|/help$|/feedback$|add_db$|add_sub$|genbatch$|editbatch$|caption$|channels$|stats$|user_stats$|broadcast$|remove_channel$|admin_list$|set_logchannel$|set_rate_limit$|clear_logs$).+"))
 async def handle_broadcast_message(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_list or user_id not in admin_pending_action or admin_pending_action[user_id] != "broadcast":
@@ -1032,17 +1133,23 @@ async def handle_broadcast_message(client: Client, message: Message):
 
     # Send broadcast to all DB and subscription channels
     all_channels = db_channels.union(force_sub_channels)
+    successful_channels = 0
     for channel_id in all_channels:
         try:
             await queue_message(client.send_message, channel_id, f"📢 Broadcast Message:\n{broadcast_message}")
+            successful_channels += 1
             await log_to_channel(client, f"Broadcast sent to channel {channel_id}: {broadcast_message}")
             logger.info(f"Broadcast sent to channel {channel_id}")
         except Exception as e:
-            await log_to_channel(client, f"Error sending broadcast to channel {channel_id}: {str(e)}")
+            await log_to_channel(client, f"Failed to send broadcast to channel {channel_id}: {str(e)}")
             logger.error(f"Error sending broadcast to channel {channel_id}: {e}")
 
-    await queue_message(message.reply, f"✅ Broadcast sent to {len(all_channels)} channels. 📣")
-    await log_to_channel(client, f"Admin {user_id} broadcasted message to {len(all_channels)} channels")
+    if successful_channels == len(all_channels):
+        await queue_message(message.reply, f"✅ Broadcast sent successfully to {len(all_channels)} channels! 📣")
+        await log_to_channel(client, f"Admin {user_id} successfully broadcasted message to {len(all_channels)} channels")
+    else:
+        await queue_message(message.reply, f"⚠️ Broadcast sent to {successful_channels}/{len(all_channels)} channels. Check logs for details. 📣")
+        await log_to_channel(client, f"Admin {user_id} partially broadcasted message: {successful_channels}/{len(all_channels)} channels successful")
 
 # Run bot
 if __name__ == "__main__":
