@@ -48,7 +48,7 @@ VERIFICATION_DURATION = 3600  # 1 hour for GPLinks usage
 PAGE_SIZE = 10  # Results per page
 DELETE_DELAY = 600  # 10 minutes in seconds
 ADMIN_PASSWORD = "12122"
-MESSAGE_DELAY = 0.5  # Delay in seconds between messages to prevent flooding
+MESSAGE_DELAY = 1.0  # Increased delay to 1 second to avoid flood control
 
 # Helper: Generate dynamic ID for callbacks and start IDs
 def generate_dynamic_id(length: int = 10) -> str:
@@ -146,7 +146,7 @@ async def help_command(client: Client, message: Message):
     help_text = (
         "📚 **Help Guide**\n"
         "━━━━━━━━━━━━━━\n"
-        "• Use `/start` to begin and get your unique Start ID.\n"
+        "• Use `/start` to begin.\n"
         "• Search for files by typing a keyword (e.g., 'movie').\n"
         "• If prompted, join the required channels to proceed.\n"
         "• Admins can use commands like `/add_db`, `/stats`, etc. (see Admin Menu).\n"
@@ -162,7 +162,7 @@ async def start(client: Client, message: Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    # Generate a unique start ID for each /start command
+    # Generate a unique start ID for each /start command (for internal use only)
     start_id = generate_dynamic_id()
     start_ids[user_id] = start_id
     await log_to_channel(client, f"User {user_id} used /start in chat {chat_id} with Start ID: {start_id}")
@@ -175,14 +175,14 @@ async def start(client: Client, message: Message):
         await message.reply("Please join the required channels to use this bot:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # Welcome message for new users (only in private chats)
+    # Welcome message for new users (only in private chats, without Start ID)
     if chat_id > 0:
         buttons = [
             [InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")],
             [InlineKeyboardButton("🕒 Recent Searches", callback_data="view_history")]
         ]
         await rate_limit_message()
-        await client.send_message(user_id, f"Welcome! Your Start ID: {start_id}\nSearch for files by typing a keyword, or use /help for guidance.", reply_markup=InlineKeyboardMarkup(buttons))
+        await client.send_message(user_id, "Welcome!\nSearch for files by typing a keyword, or use /help for guidance.", reply_markup=InlineKeyboardMarkup(buttons))
 
     # Admin menu (text-based with "three lines" style, only in private chats)
     if chat_id > 0 and user_id in admin_list:
@@ -204,7 +204,7 @@ async def start(client: Client, message: Message):
         )
     else:
         await rate_limit_message()
-        await message.reply(f"Hi! Your Start ID: {start_id}\nSend me a keyword to search for files, or use /help for guidance.")
+        await message.reply("Hi!\nSend me a keyword to search for files, or use /help for guidance.")
 
 # Handle admin commands
 @app.on_message(filters.private & filters.command(["add_db", "add_sub", "stats", "broadcast", "remove_channel", "admin_list", "set_logchannel", "clear_logs"]))
@@ -353,7 +353,7 @@ async def handle_query(client: Client, message: Message):
             return
 
     await rate_limit_message()
-    await message.reply("🔍 Searching in database channels...")
+    searching_msg = await message.reply("🔍 Searching in database channels...")
 
     # Search channels concurrently
     results = []
@@ -389,34 +389,32 @@ async def handle_query(client: Client, message: Message):
 
     if not results:
         await rate_limit_message()
-        await message.reply("No files found in the database channels.")
+        await searching_msg.edit("No files found in the database channels.")
         return
 
-    # Provide feedback on search results
+    # Provide feedback on search results (only one message for the first page)
     await rate_limit_message()
-    await message.reply(f"✅ Found {len(results)} file(s) matching your query.")
+    await searching_msg.edit(f"✅ Found {len(results)} file(s) matching your query.")
 
-    # Paginate results with improved performance (cache results)
+    # Paginate results, but only send the first page initially
     pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
-    for page_num, page in enumerate(pages, 1):
-        buttons = []
-        for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
-            dyn_id = generate_dynamic_id()
-            button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
-            buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
-        buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
-        if len(pages) > 1:
-            nav_buttons = []
-            if page_num > 1:
-                nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page_num-1}"))
-            if page_num < len(pages):
-                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
-            if nav_buttons:
-                buttons.append(nav_buttons)
-        await rate_limit_message()
-        response = await message.reply(f"📂 Search Results (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
-        message_pairs[chat_id] = (message.id, response.id)
-        asyncio.create_task(delete_messages_later(client, chat_id, message.id, response.id))
+    page_num = 1
+    page = pages[page_num - 1]  # First page
+    buttons = []
+    for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
+        dyn_id = generate_dynamic_id()
+        button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
+    buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
+    if len(pages) > 1:
+        nav_buttons = []
+        if page_num < len(pages):
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
+        buttons.append(nav_buttons)
+    await rate_limit_message()
+    response = await message.reply(f"📂 Search Results (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
+    message_pairs[chat_id] = (message.id, response.id)
+    asyncio.create_task(delete_messages_later(client, chat_id, message.id, response.id))
 
 # Callback query handler
 @app.on_callback_query()
@@ -482,6 +480,57 @@ async def handle_callbacks(client: Client, callback_query):
                     [InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")]
                 ]))
             await log_to_channel(client, f"User {user_id} requested direct download link for message {msg_id} in channel {channel_id}")
+
+    elif data.startswith("page_"):
+        page_num = int(data.split("_")[1])
+        # Recompute results (this is a simplified approach; in a real app, you'd cache the results)
+        query = user_search_history[user_id][-1][0] if user_search_history[user_id] else ""
+        results = []
+        async def search_channel(channel_id: int):
+            try:
+                if not await check_bot_privileges(client, channel_id, require_admin=False):
+                    logger.warning(f"Bot lacks access to channel {channel_id}")
+                    return
+                async for msg in client.search_messages(chat_id=channel_id, query=query, limit=SEARCH_LIMIT):
+                    if msg.media == MessageMediaType.DOCUMENT and hasattr(msg, 'document') and msg.document:
+                        results.append({
+                            "file_name": msg.document.file_name or "Unnamed File",
+                            "file_size": round(msg.document.file_size / (1024 * 1024), 2),
+                            "file_id": msg.document.file_id,
+                            "msg_id": msg.id,
+                            "channel_id": channel_id
+                        })
+            except errors.ChannelPrivate:
+                logger.error(f"Channel {channel_id} is private or bot lacks access")
+                db_channels.discard(channel_id)
+            except Exception as e:
+                await log_to_channel(client, f"Search error in channel {channel_id}: {str(e)}")
+                logger.error(f"Search error in channel {channel_id}: {e}")
+
+        tasks = [search_channel(channel_id) for channel_id in db_channels]
+        await asyncio.gather(*tasks)
+
+        pages = [results[i:i + PAGE_SIZE] for i in range(0, len(results), PAGE_SIZE)]
+        if page_num < 1 or page_num > len(pages):
+            await callback_query.answer("Invalid page number.", show_alert=True)
+            return
+
+        page = pages[page_num - 1]
+        buttons = []
+        for idx, file in enumerate(page, start=(page_num-1)*PAGE_SIZE + 1):
+            dyn_id = generate_dynamic_id()
+            button_text = f"{idx}. 📁 {file['file_name']} ({file['file_size']}MB)"
+            buttons.append([InlineKeyboardButton(button_text, callback_data=f"get_{file['channel_id']}_{file['msg_id']}_{dyn_id}")])
+        buttons.append([InlineKeyboardButton("📖 How to Download", url="https://t.me/c/2323164776/7")])
+        nav_buttons = []
+        if page_num > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page_num-1}"))
+        if page_num < len(pages):
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page_num+1}"))
+        if nav_buttons:
+            buttons.append(nav_buttons)
+        await rate_limit_message()
+        await callback_query.message.edit(f"📂 Search Results (Page {page_num}/{len(pages)}):", reply_markup=InlineKeyboardMarkup(buttons))
 
     # Admin actions with password prompt
     elif data in ["add_db", "add_sub", "stats", "remove_channel"] and user_id in admin_list:
